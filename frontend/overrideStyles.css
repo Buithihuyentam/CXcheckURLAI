@@ -1,0 +1,185 @@
+/* Base */
+@import url("https://fonts.googleapis.com/css2?family=Lexend&display=swap");
+body {
+  background-color: #f7f7f7;
+  color: #333;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Oxygen,
+    Ubuntu, Cantarell, "Helvetica Neue", Arial, sans-serif;
+
+  /* --- THAY ĐỔI QUAN TRỌNG --- */
+  height: 100vh; /* Chiều cao cố định bằng màn hình */
+  margin: 0; /* Xóa margin mặc định */
+  padding: 0; /* Xóa padding top 40px cũ */
+  overflow: hidden; /* Ẩn thanh cuộn */
+
+  /* Căn giữa nội dung vào chính giữa màn hình */
+  align-items: center;
+  justify-content: center;
+}
+
+/* Main container */
+.container {
+  width: 100%;
+  max-width: 800px; /* Giảm max-width một chút cho gọn */
+  padding: 15px; /* Padding nhỏ cho thiết bị di động */
+  box-sizing: border-box;
+}
+
+/* Warning header */
+h1 {
+  text-align: center;
+  font-size: 1.5rem; /* Giảm font size một chút */
+  font-weight: 600;
+  color: #b02a37;
+  margin-bottom: 15px; /* Giảm từ 30px xuống 15px */
+  position: relative;
+  margin-top: 0;
+}
+
+/* Warning icon above title */
+h1::before {
+  content: "!";
+  display: block;
+  /* Giảm kích thước icon cho đỡ chiếm chỗ */
+  width: 50px;
+  height: 50px;
+  line-height: 50px;
+  margin: 0 auto 10px; /* Giảm margin bottom */
+  background-color: #dc3545;
+  color: #fff;
+  border-radius: 50%;
+  font-size: 1.8rem;
+  font-weight: 700;
+}
+
+/* Report box wrapper */
+#reportContainer {
+  background-color: #ffffff;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 15px; /* Giảm padding từ 25px xuống 15px */
+  margin-bottom: 15px; /* Giảm margin */
+}
+
+/* Section title */
+#reportContainer h3 {
+  font-size: 1rem;
+  font-weight: 600;
+  color: #0d6efd;
+  margin-top: 0;
+  margin-bottom: 10px;
+}
+
+/* Textarea */
+#reportBox {
+  width: 100%;
+  min-height: 80px; /* Giảm chiều cao mặc định từ 120px xuống 80px */
+  border: 1px solid #ced4da;
+  border-radius: 4px;
+  padding: 8px;
+  font-size: 0.9rem;
+  box-sizing: border-box; /* Đảm bảo padding không làm vỡ layout */
+}
+
+#reportBox:focus {
+  outline: none;
+  border-color: #86b7fe;
+  box-shadow: 0 0 0 0.2rem rgba(13, 110, 253, 0.25);
+}
+
+/* Buttons */
+#reportBtn {
+  white-space: nowrap;
+}
+
+/* Info sections */
+/* Chỉnh lại phần này để nếu màn hình quá bé nó sẽ có thanh cuộn riêng bên trong */
+.info-section {
+  background-color: #fff;
+  border: 1px solid #ddd;
+  border-radius: 6px;
+  padding: 15px;
+  margin-top: 15px;
+
+  /* Tùy chọn: Nếu text quá dài, chỉ phần này cuộn thôi, trang web vẫn đứng yên */
+  /* max-height: 25vh;
+  overflow-y: auto; */
+}
+
+.info-section h4 {
+  font-size: 0.95rem;
+  font-weight: 600;
+  margin-bottom: 5px;
+  margin-top: 0;
+}
+
+.info-section p {
+  font-size: 0.85rem;
+  line-height: 1.4;
+  color: #555;
+  margin-bottom: 0;
+}
+
+/* Responsive cho màn hình laptop nhỏ (dưới 768px chiều cao) */
+@media (max-height: 700px) {
+  h1::before {
+    width: 40px;
+    height: 40px;
+    line-height: 40px;
+    font-size: 1.5rem;
+  }
+  #reportBox {
+    min-height: 60px;
+  }
+  .container {
+    transform: scale(0.9); /* Thu nhỏ cả khối lại 90% nếu màn hình quá thấp */
+  }
+  /* ===== SAFE BUTTON (Back) ===== */
+  #backBtn {
+    background-color: #e7f3ff;
+    color: #0d6efd;
+    border: 1px solid #b6d4fe;
+    font-weight: 600;
+    padding: 12px 24px;
+    border-radius: 6px;
+    transition: all 0.15s ease;
+    line-height: 1.2;
+  }
+
+  /* Hover */
+  #backBtn:hover {
+    background-color: #d0e7ff;
+    border-color: #9ec5fe;
+    color: #084298;
+  }
+
+  /* Focus */
+  #backBtn:focus {
+    outline: none;
+    box-shadow: 0 0 0 0.2rem rgba(13, 110, 253, 0.25);
+  }
+
+  /* ===== DANGER BUTTON (Proceed) ===== */
+  #proceedBtn {
+    background-color: #dc3545;
+    color: #fff;
+    border: 1px solid #dc3545;
+    font-weight: 600;
+    padding: 12px 24px;
+    border-radius: 6px;
+    transition: all 0.15s ease;
+    line-height: 1.2;
+  }
+
+  /* Hover */
+  #proceedBtn:hover {
+    background-color: #b02a37;
+    border-color: #b02a37;
+  }
+
+  /* Focus */
+  #proceedBtn:focus {
+    outline: none;
+    box-shadow: 0 0 0 0.2rem rgba(220, 53, 69, 0.25);
+  }
+}

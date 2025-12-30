@@ -1,0 +1,251 @@
+@import url("https://fonts.googleapis.com/css2?family=Lexend&display=swap");
+
+/* ===============================
+   COLOR SYSTEM – Light / AdGuard
+   =============================== */
+:root {
+  --accentColor: #f5f7fb; /* nền sáng */
+  --primaryColor: #4caf50; /* xanh AdGuard */
+  --secondaryColor: #e0e6ed; /* xám nhạt */
+  --textPrimary: #1f2937; /* chữ chính */
+  --textSecondary: #6b7280; /* chữ phụ */
+  --white: #ffffff;
+}
+
+/* ===============================
+   RESET
+   =============================== */
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+/* ===============================
+   BODY / POPUP
+   =============================== */
+body {
+  font-family: "Lexend", sans-serif;
+  width: 19rem;
+  padding: 0.5rem 0rem;
+
+  background-color: var(--accentColor);
+  color: var(--textPrimary);
+
+  display: grid;
+  grid-template-columns: repeat(1, 1fr);
+  justify-items: center;
+  align-content: start;
+}
+
+/* ===============================
+   TOGGLE SWITCH
+   =============================== */
+#onOffButton {
+  width: 56%;
+  height: 5rem;
+  position: relative;
+  display: inline-block;
+}
+
+#toggleCheckBox {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.roundSlider {
+  position: absolute;
+  inset: 0;
+  cursor: pointer;
+
+  background-color: #d1d5db;
+  border-radius: 3rem;
+  transition: 0.4s;
+}
+p {
+  margin-top: 0.5rem;
+  margin-bottom: 0;
+}
+
+.roundSlider::before {
+  content: "";
+  position: absolute;
+
+  height: 4rem;
+  width: 4rem;
+  top: 0.5rem;
+  left: 0.6rem;
+
+  background-color: var(--white);
+  border-radius: 50%;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.2);
+  transition: 0.4s;
+}
+
+#toggleCheckBox:checked + .roundSlider {
+  background-color: var(--primaryColor);
+}
+
+#toggleCheckBox:checked + .roundSlider::before {
+  transform: translateX(4.8rem);
+}
+
+/* ===============================
+   DIVIDER
+   =============================== */
+hr {
+  border: none;
+  width: 90%;
+  height: 0.1rem;
+  border-radius: 1rem;
+  background-color: var(--textSecondary);
+}
+
+/* ===============================
+   SITE URL CARD
+   =============================== */
+#siteUrl {
+  width: 90%;
+  padding: 0.6rem;
+
+  background-color: var(--white);
+  border-radius: 1rem;
+  text-align: center;
+
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+}
+
+#siteUrl a {
+  color: var(--primaryColor);
+  text-decoration: none;
+  font-weight: 600;
+}
+
+#siteUrl a:hover {
+  text-decoration: underline;
+}
+
+/* ===============================
+   DETAILS
+   =============================== */
+#detailsContainer {
+  width: 90%;
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 0.3rem;
+}
+
+.detail {
+  font-size: 0.75rem;
+  color: var(--textSecondary);
+}
+
+/* ===============================
+   HEADINGS
+   =============================== */
+h5 {
+  margin: 0;
+  font-size: 1rem;
+  text-align: center;
+  color: var(--primaryColor);
+}
+
+/* ===============================
+   REPORT FORM
+   =============================== */
+#reportContainer {
+  width: 90%;
+  display: grid;
+  justify-items: center;
+  row-gap: 0.4rem;
+}
+
+label {
+  font-size: 0.9rem;
+  color: var(--textPrimary);
+}
+
+textarea,
+#urlForReport {
+  width: 100%;
+  border-radius: 0.5rem;
+  border: 1px solid var(--secondaryColor);
+  padding: 0.4rem;
+  font-family: inherit;
+}
+
+textarea {
+  resize: none;
+}
+
+#urlForReport {
+  height: 1.8rem;
+}
+
+/* ===============================
+   BUTTON
+   =============================== */
+#submitReport {
+  height: 2.6rem;
+  width: 9rem;
+
+  font-size: 0.95rem;
+  font-weight: 600;
+
+  color: var(--white);
+  background-color: var(--primaryColor);
+
+  border: none;
+  border-radius: 0.6rem;
+
+  box-shadow: 0 4px 10px rgba(76, 175, 80, 0.35);
+  transition: all 0.25s ease;
+}
+
+#submitReport:hover {
+  cursor: pointer;
+  transform: translateY(-1px);
+  box-shadow: 0 6px 14px rgba(76, 175, 80, 0.45);
+}
+/* Khung chứa chính cho header */
+.header-container {
+  display: flex; /* Dùng Flexbox để xếp các mục trên một hàng */
+  justify-content: space-between; /* Đẩy 2 cụm trái/phải ra xa nhau */
+  align-items: center; /* Căn giữa các mục theo chiều dọc */
+  width: 90%; /* Chiều rộng bằng các thành phần khác */
+  margin-bottom: 0.8rem; /* Tạo khoảng cách với nút bật/tắt bên dưới */
+}
+
+/* Cụm bên trái (chứa icon và tên) */
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: 0.6rem; /* Khoảng cách giữa icon và tên */
+}
+
+/* Icon */
+.header-icon {
+  width: 24px; /* Kích thước icon */
+  height: 24px;
+}
+
+/* Tên Extension */
+.header-title {
+  font-size: 1rem; /* Cỡ chữ */
+  font-weight: 600; /* Độ đậm */
+  color: var(--textPrimary);
+
+  margin: 0; /* Xóa margin mặc định của thẻ h2 */
+  margin-left: 1.7rem;
+}
+
+/* Nhãn phiên bản (v1.0) */
+.header-version {
+  background-color: #ffffff; /* Màu nền xám nhạt (giống Bootstrap) */
+  color: #6c757d; /* Màu chữ xám đậm */
+  padding: 0.2rem 0.6rem; /* Tạo khoảng đệm bên trong */
+  border-radius: 1rem; /* Bo tròn các góc */
+  font-size: 0.75rem; /* Cỡ chữ nhỏ */
+  font-weight: 600;
+}
