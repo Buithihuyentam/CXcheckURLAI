@@ -6,7 +6,7 @@ from nltk.stem.porter import PorterStemmer
 import pickle
 import joblib
 import re
-
+import requests
 
 # GET THE DOMAIN NAME FROM THE URL
 def get_domain_name(url: str) -> str:

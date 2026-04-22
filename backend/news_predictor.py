@@ -12,7 +12,8 @@ model = joblib.load('MLModels\\' + 'fakeNewsModel.pkl')
 print('=> Pickle Loaded : Model ')
 tfidfvect = joblib.load('MLModels\\' + 'fakeNewsVectorizer.pkl')
 print('=> Pickle Loaded : Vectorizer')
-
+phish_path = joblib.load('MLModels\\' + 'phishing.pkl')
+print('=> Pickle Loaded : Phishing Model')
 # --- BẮT ĐẦU ĐOẠN CODE SOI MODEL ---
 try:
     print("\nDang phan tich Model...")
@@ -42,9 +43,18 @@ try:
             print(f"Từ: '{word}' (Điểm: {val:.3f})")
     else:
         print("Model này không phải Linear (có thể là Tree/Forest), không xem được coef_.")
+
+    print("\n--- SOARING PHISHING MODEL ---")
+    if hasattr(phish_path, 'feature_importances_'):
+        print("Trong so cac dac trung (Feature Importances):")
+        importances = phish_path.feature_importances_
+        for i, v in enumerate(importances):
+            print(f"  Dac trung {i}: {v:.4f}")
+    else:
+        print("Model phishing khong co feature_importances_")
 except Exception as e:
     print("Khong the soi model do loi: ", e)
-# --- KẾT THÚC ĐOẠN CODE SOI MODEL ---
+
 
 class PredictionModel:
     output = {}
