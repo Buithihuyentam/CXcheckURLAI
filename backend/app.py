@@ -11,14 +11,21 @@ from fastapi.middleware.cors import CORSMiddleware
 from urllib.parse import urlparse
 from typing import List
 import re
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 
 # Local files
-from helpers import get_domain_name, reviewTester, phish_model_ls
+from predictor_improved import extract_features_async, get_risk_report
+from helpers import get_domain_name
 from models import PhishingReportSchema, reviewDetectionSchema, PhishingReport, newsDetectionSchema, mistakePhishingReport
-from news_predictor import PredictionModel
+# from debug_model
 
 # Initialize FastAPI
 app = FastAPI()
+
+# Vì thư viện whoisdomain chạy đồng bộ (blocking), ta dùng ThreadPool để không làm treo server
+executor = ThreadPoolExecutor(max_workers=10)
+
 
 async def get_original_url(short_url):
     headers = {
@@ -128,13 +135,10 @@ async def predict(url: str):
     if is_reported:
         is_phishing = True
     else:
-        # 5. Nếu DB không có, mới dùng Model AI để dự đoán
-        X_predict = [str(domain)]
-        y_Predict = phish_model_ls.predict(X_predict)
-        
-        # Model thường trả về mảng, ví dụ ['bad'] hoặc ['good']
-        if y_Predict[0] == 'bad':
-            is_phishing = True
+        # 5. Nếu DB không có, dùng model trong predictor.py để dự đoán
+        features = await extract_features_async(url)
+        report = get_risk_report(url, features)
+        is_phishing = report["is_phishing"]
 
     # 6. Trả về kết quả cuối cùng
     return {
@@ -197,8 +201,10 @@ async def update(id: int, real: bool):
 
 @app.get('/details')
 async def whois(url: str):
-    print(f"Fetching details for URL: {url}")
-    original_url= await get_original_url(url)
+    print(f"Get details for URL: {url}")
+    original_url = {"final_url": url} # Mặc định nếu không phải t.co thì final_url chính là url gốc
+    if "t.co" in url: 
+        original_url= await get_original_url(url)
     domain = get_domain_name(original_url["final_url"])
     try:
         whois_data = whoisdomain.query(domain)
@@ -250,40 +256,26 @@ async def analyze_link(url: str):
     if not domain:
         return {"error": "Invalid URL", "is_phishing": True, "details": None}
 
-    X_predict = [str(domain)]
-    y_Predict = phish_model_ls.predict(X_predict)
+    features = await extract_features_async(url)
+    report = get_risk_report(url, features)
+    
+    print(f"Kêt quả dự đoán trong analyze: ")
+    print(f"    - Mức độ: {report['level']}")
+    print(f"    - Điểm an toàn: {report['risk_score']}%")
+    print(f"    - Cảnh báo lừa đảo: {'CÓ' if report['is_phishing'] else 'KHÔNG'}")
     
     is_in_db = await PhishingReport.filter(url=domain, real=True).exists()
     
-    is_phishing = (y_Predict[0] == 'bad') or is_in_db
+    is_phishing = report["is_phishing"] or is_in_db
 
-    try:
-        whois_data = whoisdomain.query(domain)
-        registrant_country = whois_data.registrant_country
-        try:
-            country_name = pycountry.countries.get(alpha_2=registrant_country).name
-        except:
-            country_name = 'Unknown'
-
-        # Format lại các thông tin chi tiết
-        details = {
-            "domain": domain,
-            "registrar": whois_data.registrar or "Unknown",
-            "country": country_name,
-            "country_code": registrant_country or "Unknown",
-            "creation_date": whois_data.creation_date.strftime('%Y/%m/%d') if whois_data.creation_date else "Unknown",
-            "org": whois_data.registrar or "Unknown" # Thường dùng Registrar làm Org nếu không có field Org riêng
-        }
-    except Exception as e:
-        print(f"WHOIS Error: {e}")
-        details = {
-            "domain": domain,
-            "registrar": "Unknown",
-            "country": "Unknown",
-            "country_code": "Unknown",
-            "creation_date": "Unknown",
-            "org": "Unknown"
-        }
+    # --- 2. Lấy thông tin chi tiết từ features đã trích xuất 
+    details = {
+        "domain": domain,
+        "country": features.get("country", "Unknown"),
+        "org": features.get("org", "Unknown"), 
+        "level": report["level"],
+        "risk_score": report["risk_score"],
+    }
 
     # --- 3. Trả về kết quả tổng hợp ---
     return {
@@ -291,79 +283,62 @@ async def analyze_link(url: str):
         "is_phishing": bool(is_phishing), # Chuyển về kiểu boolean thật (True/False)
         "details": details
     }
+       
+       
+async def process_single_url(url):
+    """Hàm xử lý tách biệt cho từng link"""
+    try:
+        # 1. Giải mã link rút gọn (Hàm httpx của bạn đã là async nên rất nhanh)
+        url_info = await get_original_url(url)
+        final_url = url_info["final_url"]
+        meta_url = url_info["meta_url"]
+        print(f"🔗 URL gốc: {url} - Link Meta: {meta_url} - Link cuối cùng: {final_url}")
+        domain = get_domain_name(final_url)
+        
+        # 2. Chạy AI và check DB đồng thời
+        is_reported = await PhishingReport.filter(url__icontains=domain, real=True).exists()
+        
+        features = await extract_features_async(meta_url)
+        report = get_risk_report(meta_url, features)
+        
+        is_phishing = report["is_phishing"] or is_reported
+        loop = asyncio.get_event_loop()
+        country, org = "Unknown", "Unknown"
+        country = features["country"]
+        try:
+            country = pycountry.countries.get(alpha_2=country_code).name
+        except:
+            country = "Unknown"
+        org = features.get("org", "Unknown")   
 
+        return {
+            "url": url,
+            "meta_url": meta_url,
+            "final_url": final_url,
+            "is_phishing": is_phishing,
+            "country": country,
+            "org": org,
+            "risk_score": report["risk_score"],
+            "color": report["color"],
+            "red_flags": report["red_flags"],
+            "level": report["level"],
+            "status": "success"
+        }
+    except Exception as e:
+        return {"url": url, "status": "error", "message": str(e)}
 
 @app.post("/scan-links")
 async def scan_multiple_links(data: UrlList):
-    urls = data.urls
-    results = []
     
     # Chỉ xử lý tối đa 10 link để tránh quá tải, lọc trùng link
-    process_urls = list(set(urls))[:10]
-
-    for url in process_urls:
-        print(f"Processing URL: {url}")
-        try:
-            # 1. Giải mã link rút gọn
-            decoded_data = await get_original_url(url)
-            
-            meta_link = decoded_data["meta_url"]   # Để hiện lên popup
-            final_link = decoded_data["final_url"] # Để check phishing/whois
-            domain = get_domain_name( final_link )
-            
-            if not domain:
-                continue
-
-            # 2. Kiểm tra Phishing (DB trước -> AI sau)
-            is_phishing = False
-            is_reported = await PhishingReport.filter(url__icontains=domain, real=True).exists()
-            
-            if is_reported:
-                is_phishing = True
-            else:
-                # Chỉ dự đoán bằng AI nếu DB chưa có
-                X_predict = [str(domain)]
-                y_Predict = phish_model_ls.predict(X_predict)
-                if y_Predict[0] == 'bad':
-                    is_phishing = True
-
-            # 3. Khởi tạo thông tin cơ bản
-            info = {
-                "url": url,
-                "real_link": meta_link,
-                "original_url":  final_link,
-                "domain": domain,
-                "is_phishing": is_phishing,
-                "country": "Unknown",
-                "org": "Unknown"
-            }
-            
-            # 4. Tra cứu WHOIS (Bọc trong try-except riêng để không làm hỏng cả vòng lặp)
-            try:
-                whois_data = whoisdomain.query(domain)
-                if whois_data:
-                    # registrant_country thường chính xác hơn cregistrant_country
-                    country = getattr(whois_data, 'registrant_country', "Unknown")
-                    # Nếu trả về mảng thì lấy phần tử đầu
-                    if isinstance(country, list): country = country[0]
-                    
-                    info["country"] = country if country else "Unknown"
-                    info["org"] = getattr(whois_data, 'registrar', "Unknown")
-            except Exception as e:
-                print(f"Lỗi WHOIS cho domain {domain}: {e}")
-
-            results.append(info)
-
-        except Exception as e:
-            # Nếu một link bị lỗi nặng, vẫn tiếp tục với link tiếp theo
-            print(f"Lỗi xử lý link {url}: {e}")
-            results.append({
-                "url": url,
-                "is_phishing": False,
-                "error": "Could not process"
-            })
-        
+    process_urls = list(set(data.urls))[:10]
+    results = []
+    
+    tasks = [process_single_url(u) for u in process_urls]
+    results = await asyncio.gather(*tasks)
+    
     return results
+
 
 # Run API with uvicorn
 if __name__ == '__main__':
