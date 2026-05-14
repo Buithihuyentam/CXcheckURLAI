@@ -1,0 +1,33 @@
+{
+  "optimal_threshold": 0.7433,
+  "beta": 0.5,
+  "method": "F-beta precision_recall_curve",
+  "dataset": "PhiUSIIL 2023 \u2014 DOI: 10.1016/j.cose.2023.103545",
+  "n_samples": 235795,
+  "n_features": 36,
+  "features_dropped": {
+    "oracle_label_proxy": [
+      "URLSimilarityIndex",
+      "TLDLegitimateProb",
+      "URLCharProb",
+      "CharContinuationRate",
+      "DomainTitleMatchScore",
+      "URLTitleMatchScore"
+    ],
+    "collection_bias": [
+      "LineOfCode",
+      "LargestLineLength",
+      "NoOfExternalRef",
+      "NoOfSelfRef",
+      "NoOfEmptyRef",
+      "NoOfImage",
+      "NoOfJS",
+      "NoOfCSS"
+    ],
+    "reason": "Deployability-Driven Feature Selection (Researcher recommendation)"
+  },
+  "auc_same_dist": 1.0,
+  "auc_ood_uci2015": 0.6995,
+  "brier_score": 0.0004,
+  "mcc": 0.9988
+}

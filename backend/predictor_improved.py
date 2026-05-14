@@ -1,656 +1,382 @@
-
 """
-Cải thiện từ predictor.py:
-1. Feature thresholds dựa trên tổng hợp dữ liệu (tìm quantiles)
-2. Confidence score dựa trên probability thật từ model
-3. Feature engineering cải thiện
-4. Loại bỏ hardcoded penalties
+Phishing URL Detection — Hybrid ML + Heuristic Predictor (v2.2)
+===============================================================
+Triển khai theo phương pháp Deployability-Driven Feature Selection.
+Mô hình: XGBoost Calibrated trained on PhiUSIIL 2023 (Cleaned).
 """
 
 import os
 import re
+import math
 import socket
 import json
 from datetime import datetime
 from urllib.parse import urlparse
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional
 
 import httpx
 import joblib
-import pandas as pd
-import whoisdomain
-from bs4 import BeautifulSoup 
-import asyncio
+from bs4 import BeautifulSoup
+import tldextract
+from cachetools import TTLCache
+import Levenshtein
 
+_BASE_DIR = os.path.dirname(__file__)
 
-MODEL_PATH = os.path.join(os.path.dirname(__file__), "MLModels", "phishing_rf_model_tuned.pkl")
-FEATURES_PATH = os.path.join(os.path.dirname(__file__), "MLModels", "phishing_rf_model_tuned_features.pkl")
+# Load XGBoost calibrated model (v2.2)
+_XGB_MODEL_PATH      = os.path.join(_BASE_DIR, "MLModels", "phishing_xgb_calibrated.pkl")
+_XGB_FEATURES_PATH   = os.path.join(_BASE_DIR, "MLModels", "phishing_xgb_features.pkl")
+_THRESHOLD_PATH      = os.path.join(_BASE_DIR, "MLModels", "optimal_threshold.json")
 
-# Load model
 try:
-    model = joblib.load(MODEL_PATH)
-    REQUIRED_FEATURES = joblib.load(FEATURES_PATH)
-except:
-    print("[!] Model file not found. Falling back to default model.")
-    MODEL_PATH = os.path.join(os.path.dirname(__file__), "MLModels", "phishing_rf_model.pkl")
-    model = joblib.load(MODEL_PATH)
-    REQUIRED_FEATURES = model.feature_names_in_.tolist()
+    model = joblib.load(_XGB_MODEL_PATH)
+    REQUIRED_FEATURES = joblib.load(_XGB_FEATURES_PATH)
+    print(f"[OK] Loaded: XGBoost + Calibrated (PhiUSIIL Clean)")
+except Exception as e:
+    raise RuntimeError(f"[!] No model found: {e}. Please run train_model_final.py")
 
-SHORTENER_DOMAINS = (
-    r"bit\.ly|goo\.gl|tinyurl\.com|ow\.ly|t\.co|tiny\.cc|is\.gd|buff\.ly|adf\.ly|bitly\.com|shorturl\.at"
-)
+try:
+    with open(_THRESHOLD_PATH) as f:
+        _threshold_meta = json.load(f)
+    OPTIMAL_THRESHOLD = _threshold_meta["optimal_threshold"]
+    print(f"[OK] Optimal threshold: {OPTIMAL_THRESHOLD}")
+except Exception:
+    OPTIMAL_THRESHOLD = 0.5
+    print("[!] optimal_threshold.json not found, using default 0.5")
 
-# Suspicious free domains (often used for phishing)
-SUSPICIOUS_TLDS = {'.tk', '.ml', '.ga', '.cf', '.xyz', '.tk', '.gq'}
+# SHAP explainer
+_shap_explainer = None
+def _get_shap_explainer():
+    global _shap_explainer
+    if _shap_explainer is None:
+        try:
+            import shap
+            if hasattr(model, 'calibrated_classifiers_'):
+                base = model.calibrated_classifiers_[0].estimator
+            else:
+                base = model
+            _shap_explainer = shap.TreeExplainer(base)
+        except Exception as e:
+            print(f"[!] SHAP init failed: {e}")
+    return _shap_explainer
 
-# Known legitimate domains (whitelist)
+# Cache
+_feature_cache: TTLCache = TTLCache(maxsize=500, ttl=3600)
+
+# ============================================================================
+# WHITELIST & RISK DICTIONARIES
+# ============================================================================
+
 LEGITIMATE_DOMAINS = {
-    "youtu.be","x.com"
-    'google.com', 'youtube.com', 'facebook.com', 'amazon.com', 'wikipedia.org',
-    'github.com', 'stackoverflow.com', 'python.org', 'golang.org', 'rust-lang.org',
-    'microsoft.com', 'apple.com', 'linkedin.com', 'instagram.com', 'twitter.com',
-    'ubuntu.com', 'docker.com', 'kubernetes.io', 'openstack.org', 'mozilla.org',
-    'reddit.com', 'twitch.tv', 'discord.com', 'slack.com', 'notion.so'
-}
-# BẠN NÊN TÍNH NHỮNG GIÁ TRỊ NÀY TỪ DATASET
-# VÍ DỤ: pd.Series(url_lengths).quantile([0.25, 0.5, 0.75])
-
-FEATURE_THRESHOLDS = {
-    'url_length': {
-        'short': 54,      # < 54 ký tự: rất ngắn (có thể legitimiate)
-        'medium': 88,     # 54-88: bình thường
-        'long': 88       # > 88: có thể nghi vấn
-    },
-    'external_ratio': {
-        'safe': 0.5,      # < 50% external resources: an toàn
-        'warning': 0.75   # 50-75%: cảnh báo
-    },
-    'anchor_ratio': {
-        'safe': 0.31,
-        'medium': 0.67
-    }
+    "youtu.be", "x.com", "google.com", "youtube.com", "facebook.com", "amazon.com",
+    "wikipedia.org", "github.com", "stackoverflow.com", "python.org", "microsoft.com",
+    "apple.com", "linkedin.com", "instagram.com", "twitter.com", "reddit.com"
 }
 
+TOP_50_BRANDS = [
+    "google", "facebook", "microsoft", "apple", "amazon", "netflix", "paypal",
+    "instagram", "linkedin", "twitter", "yahoo", "whatsapp", "tiktok", "spotify"
+]
+
+SUSPICIOUS_TLDS = {'tk', 'ml', 'ga', 'cf', 'xyz', 'gq', 'top', 'pw', 'online', 'site'}
+
+def _get_registered_domain(url: str) -> str:
+    ext = tldextract.extract(url)
+    if ext.domain and ext.suffix:
+        return f"{ext.domain}.{ext.suffix}"
+    return ""
+
+def _is_whitelisted(url: str) -> bool:
+    return _get_registered_domain(url) in LEGITIMATE_DOMAINS
+
 # ============================================================================
-# FEATURE EXTRACTION - CỐI THIỆN
+# FEATURE EXTRACTION (36 Features PhiUSIIL)
 # ============================================================================
 
-def _get_url_length_feature(url: str) -> int:
-    """
-    Cải thiện: Dựa trên phân tích thống kê
-    - Phishing URLs thường dài hơn để ẩn tên miền thật
-    """
-    length = len(url)
-    if length < FEATURE_THRESHOLDS['url_length']['short']:
-        return 1   # Safe
-    elif length <= FEATURE_THRESHOLDS['url_length']['medium']:
-        return 0   # Neutral
-    else:
-        return -1  # Suspicious
+async def extract_features_async(url: str) -> Dict[str, float]:
+    cache_key = url.lower().strip()
+    if cache_key in _feature_cache:
+        return _feature_cache[cache_key]
 
-
-def _external_ratio(url: str, items: List[str]) -> float:
-    """
-    Tỷ lệ external resources
-    - High ratio: dựa vào external resources (phishing tactic)
-    """
-    if not items:
-        return 0.0
-    
-    domain = urlparse(url).netloc.lower()
-    external = sum(
-        1 for item in items
-        if urlparse(item).netloc.lower() and urlparse(item).netloc.lower() != domain
-    )
-    return external / len(items)
-
-
-def _get_anchor_ratio(url: str, anchors: List[str]) -> int:
-    """
-    Tỷ lệ links đến external domains
-    """
-    if not anchors:
-        return 1
-    
-    ratio = _external_ratio(url, anchors)
-    
-    if ratio == 0:
-        return 1      # All internal
-    elif ratio <= FEATURE_THRESHOLDS['anchor_ratio']['safe']:
-        return 1      # Mostly internal
-    elif ratio <= FEATURE_THRESHOLDS['anchor_ratio']['medium']:
-        return 0      # Mixed
-    else:
-        return -1     # Mostly external
-
-
-def _domain_age_days(creation_date) -> int:
-    """Tính tuổi domain tính từ ngày tạo"""
-    if not creation_date:
-        return -1
-    
-    try:
-        now = datetime.now()
-        if isinstance(creation_date, list):
-            creation_date = creation_date[0]
-        
-        age = (now - creation_date).days
-        return max(0, age)
-    except:
-        return -1
-
-
-def _domain_remaining_days(expiration_date) -> int:
-    """Tính thời gian còn lại của domain"""
-    if not expiration_date:
-        return -1
-    
-    try:
-        now = datetime.now()
-        if isinstance(expiration_date, list):
-            expiration_date = expiration_date[0]
-        
-        remaining = (expiration_date - now).days
-        print(f"    → Domain remaining days: {remaining}")
-        return remaining
-    except:
-        return -1
-
-
-def get_first_date(d):
-    """Extract first date from list or return as-is"""
-    if isinstance(d, list):
-        return d[0] if d else None
-    return d
-
-
-def heuristic_phishing_score(url: str, features_dict: Dict) -> float:
-    """
-    Heuristic-based phishing detection (rule-based)
-    Returns score 0-100, higher = more likely phishing
-    
-    Useful when ML model is not reliable or not trained yet
-    """
-    score = 50  # Start at neutral
-    
-    domain = urlparse(url).netloc.lower()
-    
-    # Rule 1: Suspicious TLDs (free domains often used for phishing)
-    tld = domain.split('.')[-1] if '.' in domain else ''
-    for sus_tld in SUSPICIOUS_TLDS:
-        if domain.endswith(sus_tld):
-            score += 20
-            break
-    
-    # Rule 2: Whitelist - if it's a known legitimate domain, lower score
-    for legit_domain in LEGITIMATE_DOMAINS:
-        if domain == legit_domain or domain.endswith('.' + legit_domain):
-            score -= 30
-            break
-    
-    # Rule 3: Domain age (from features)
-    if features_dict.get('age_of_domain') == -1:  # Recently registered
-        score += 15
-    
-    # Rule 4: No HTTPS
-    if features_dict.get('SSLfinal_State') == -1:
-        score += 20
-    
-    # Rule 5: IP address in URL
-    if features_dict.get('having_IPhaving_IP_Address') == -1:
-        score += 25
-    
-    # Rule 6: URL shortener
-    if features_dict.get('Shortining_Service') == -1:
-        score += 20
-    
-    # Rule 7: Multiple redirects
-    if features_dict.get('Redirect') == -1:
-        score += 15
-    
-    # Rule 8: Hyphen in domain (typosquatting indicator)
-    if features_dict.get('Prefix_Suffix') == -1:
-        score += 10
-    
-    # Rule 9: Too many subdomains
-    if features_dict.get('having_Sub_Domain') == -1:
-        score += 10
-    
-    # Rule 10: Form submitting to suspicious target
-    if features_dict.get('SFH') == -1:
-        score += 20
-    
-    # Clamp between 0 and 100
-    return max(0, min(100, score))
-
-
-async def extract_features_async(url: str) -> Dict[str, int]:
-    """
-    Trích xuất features từ URL
-    
-    Kết quả:
-    - 1: Chỉ dấu hiệu lành (legitimate)
-    - 0: Trung lập
-    - -1: Chỉ dấu hiệu nghi vấn (phishing)
-    """
-    
-    print(f"\n[+] Analyzing: {url}")
-    features = {name: 0 for name in REQUIRED_FEATURES}
-    content_fetched = True  # Track if we successfully fetched page content
+    features = {name: 0.0 for name in REQUIRED_FEATURES}
     
     parsed = urlparse(url)
     domain = parsed.netloc.lower()
     path = parsed.path or ""
+    ext = tldextract.extract(url)
 
-    # ========== URL STRUCTURE FEATURES ==========
+    # 1. URL Lexical Features
+    features['URLLength'] = len(url)
+    features['DomainLength'] = len(domain)
+    features['IsDomainIP'] = 1.0 if re.search(r"(\d{1,3}\.){3}\d{1,3}", domain) else 0.0
+    features['TLDLength'] = len(ext.suffix) if ext.suffix else 0
+    features['NoOfSubDomain'] = len(ext.subdomain.split('.')) if ext.subdomain else 0
     
-    # 1. IP Address Detection
-    features['having_IPhaving_IP_Address'] = -1 if re.search(r"(\d{1,3}\.){3}\d{1,3}", url) else 1
-    print(f"    → IP address in URL: {'Yes' if features['having_IPhaving_IP_Address'] == -1 else 'No'}")
+    # Obfuscation (rất cơ bản: kiểm tra URL encoded chars như %20)
+    features['NoOfObfuscatedChar'] = url.count('%')
+    features['HasObfuscation'] = 1.0 if features['NoOfObfuscatedChar'] > 0 else 0.0
+    features['ObfuscationRatio'] = features['NoOfObfuscatedChar'] / max(1, len(url))
     
-    # 2. URL Length
-    features['URLURL_Length'] = _get_url_length_feature(url)
-    print(f"    → URL Length: {features['URLURL_Length']}")
-    # 3. URL Shortener Service
-    features['Shortining_Service'] = -1 if re.search(SHORTENER_DOMAINS, url) else 1
-    print(f"    → URL Shortener Service: {'Yes' if features['Shortining_Service'] == -1 else 'No'}")
-
-    # 4. @ Symbol (redirect)
-    features['having_At_Symbol'] = -1 if "@" in url else 1
-    print(f"    → @ Symbol in URL: {'Yes' if features['having_At_Symbol'] == -1 else 'No'}")
-
-    # 5. Double slash redirecting
-    slash_index = url.find("//", url.find("://") + 3)
-    features['double_slash_redirecting'] = -1 if slash_index != -1 else 1
-    print(f"    → Double slash redirecting: {'Yes' if features['double_slash_redirecting'] == -1 else 'No'}")
-
-    # 6. Prefix/Suffix (- trong domain)
-    features['Prefix_Suffix'] = -1 if "-" in domain else 1
-    print(f"    → Hyphen in domain: {'Yes' if features['Prefix_Suffix'] == -1 else 'No'}")
-
-    # 7. Sub domains
-    subdomain_count = domain.count('.')
-    features['having_Sub_Domain'] = -1 if subdomain_count > 2 else 1
-    print(f"    → Sub domains: {'Yes' if features['having_Sub_Domain'] == -1 else 'No'}")
-
-    # 8. HTTPS/SSL
-    features['SSLfinal_State'] = 1 if url.startswith('https://') else -1
-    features['HTTPS_token'] = -1 if re.search(r'https[^/]', url.replace('https://', '').replace('http://', '')) else 1
-    print(f"    → HTTPS/SSL: {'Yes' if features['SSLfinal_State'] == 1 else 'No'}")
-    # 9. Non-standard port
-    if parsed.port and parsed.port not in (80, 443):
-        features['port'] = -1
-    else:
-        features['port'] = 1
-    print(f"    → Non-standard port: {'Yes' if features['port'] == -1 else 'No'}")
-
-    # ========== PAGE CONTENT FEATURES (Requires HTTP call) ==========
+    # Chars distribution
+    letters = sum(c.isalpha() for c in url)
+    digits = sum(c.isdigit() for c in url)
+    features['NoOfLettersInURL'] = letters
+    features['LetterRatioInURL'] = letters / max(1, len(url))
+    features['NoOfDegitsInURL'] = digits
+    features['DegitRatioInURL'] = digits / max(1, len(url))
     
-    is_shortener = features['Shortining_Service'] == -1
-    print(f"    → Is URL shortener: {'Yes' if is_shortener else 'No'}")
+    features['NoOfEqualsInURL'] = url.count('=')
+    features['NoOfQMarkInURL'] = url.count('?')
+    features['NoOfAmpersandInURL'] = url.count('&')
     
-    if is_shortener:
-        print(f"⚠️  Shortener URL detected - skipping content analysis")
-        content_fetched = False
-        # Set default values untuk network-dependent features
-        default_content_features = {
-            'Favicon': 1,
-            'Request_URL': 1,
-            'URL_of_Anchor': 1,
-            'Links_in_tags': 1,
-            'SFH': 1,
-            'Submitting_to_email': 1,
-            'Abnormal_URL': 0,
-            'Redirect': 1,
-            'on_mouseover': 1,
-            'RightClick': 1,
-            'popUpWidnow': 1,
-            'Iframe': 1,
-        }
-        for key, value in default_content_features.items():
-            if key in features:
-                features[key] = value
-    else: #nếu không phải là link shortener                                         
-        try:
-            async with httpx.AsyncClient(timeout=5.0, follow_redirects=True) as client:
-                response = await client.get(url)
-                html = response.text
-                soup = BeautifulSoup(html, 'html.parser')
-
-                # Favicon
-                favicon = soup.find('link', rel=lambda v: v and 'icon' in v.lower())
-                if favicon and favicon.get('href'):
-                    favicon_url = favicon['href']
-                    favicon_domain = urlparse(favicon_url).netloc.lower()
-                    features['Favicon'] = -1 if favicon_domain and favicon_domain != domain else 1
-                else:
-                    features['Favicon'] = 1
-
-                # External Resources (img, script, link)
-                resources = []
-                for tag in soup.find_all(['img', 'script', 'link']):
-                    src = tag.get('src') or tag.get('href')
-                    if src:
-                        resources.append(src)
-                
-                ext_ratio = _external_ratio(url, resources)
-                features['Request_URL'] = -1 if ext_ratio > FEATURE_THRESHOLDS['external_ratio']['safe'] else 1
-
-                # Anchor tags
-                anchors = [a['href'] for a in soup.find_all('a', href=True)]
-                features['URL_of_Anchor'] = _get_anchor_ratio(url, anchors)
-
-                # Links in tags
-                tags = [tag for tag in soup.find_all(['a', 'img', 'link', 'script'])]
-                tag_resources = [tag.get('href') or tag.get('src') for tag in tags 
-                               if tag.get('href') or tag.get('src')]
-                features['Links_in_tags'] = -1 if _external_ratio(url, tag_resources) > FEATURE_THRESHOLDS['external_ratio']['safe'] else 1
-
-                # Server Form Handler (SFH)
-                forms = soup.find_all('form', action=True)
-                features['SFH'] = 1
-                for form in forms:
-                    action = form.get('action', '')
-                    if action in ['', 'about:blank']:
-                        features['SFH'] = -1
-                        break
-                    action_domain = urlparse(action).netloc.lower()
-                    if action_domain and action_domain != domain:
-                        features['SFH'] = 0
-                        break
-
-                # Submitting to email
-                features['Submitting_to_email'] = -1 if any('mailto:' in form.get('action', '').lower() for form in forms) else 1
-                
-                # Abnormal URL
-                features['Abnormal_URL'] = -1 if domain not in path else 0
-                
-                # Redirect
-                features['Redirect'] = -1 if len(response.history) > 1 else 1
-                
-                # JavaScript suspicious behaviors
-                features['on_mouseover'] = -1 if 'onmouseover' in html.lower() else 1
-                features['RightClick'] = -1 if 'oncontextmenu' in html.lower() else 1
-                features['popUpWidnow'] = -1 if 'window.open' in html.lower() or 'alert(' in html.lower() else 1
-                features['Iframe'] = -1 if soup.find('iframe') else 1
-                
-        except Exception as e:
-            print(f"[!] Error fetching content: {type(e).__name__}: {e}")
-            print(f"    → Using safe defaults (cannot verify page content)")
-            content_fetched = False
-            # Fallback values - use NEUTRAL (0) not SUSPICIOUS (-1) when unable to verify
-            default_content_features = {
-                'Favicon': 0,              # Neutral - couldn't verify
-                'Request_URL': 0,          # Neutral - couldn't verify
-                'URL_of_Anchor': 0,        # Neutral - couldn't verify
-                'Links_in_tags': 0,        # Neutral - couldn't verify
-                'SFH': 0,                  # Neutral - couldn't verify
-                'Submitting_to_email': 0,  # Neutral - couldn't verify
-                'Abnormal_URL': 0,         # Neutral
-                'Redirect': 0,             # Neutral - couldn't verify
-                'on_mouseover': 0,         # Neutral - couldn't verify
-                'RightClick': 0,           # Neutral - couldn't verify
-                'popUpWidnow': 0,          # Neutral - couldn't verify
-                'Iframe': 0,               # Neutral - couldn't verify
-            }
-            for key, value in default_content_features.items():
-                if key in features:
-                    features[key] = value
-
-    # ========== WHOIS & DNS FEATURES ==========
+    special_chars = sum(not c.isalnum() for c in url)
+    features['NoOfOtherSpecialCharsInURL'] = special_chars
+    features['SpacialCharRatioInURL'] = special_chars / max(1, len(url))
     
+    features['IsHTTPS'] = 1.0 if url.startswith('https://') else 0.0
+    
+    # Keywords
+    url_lower = url.lower()
+    features['Bank'] = 1.0 if 'bank' in url_lower else 0.0
+    features['Pay'] = 1.0 if 'pay' in url_lower else 0.0
+    features['Crypto'] = 1.0 if 'crypto' in url_lower or 'wallet' in url_lower else 0.0
+
+    # 2. Page Content Features (Fetch <head> nhanh)
+    # Default 0.0 (Neutral/False) neu khong fetch duoc
+    features['HasTitle'] = 0.0
+    features['HasFavicon'] = 0.0
+    features['Robots'] = 0.0
+    features['IsResponsive'] = 0.0
+    features['NoOfURLRedirect'] = 0.0
+    features['NoOfSelfRedirect'] = 0.0
+    features['HasDescription'] = 0.0
+    features['NoOfPopup'] = 0.0
+    features['NoOfiFrame'] = 0.0
+    features['HasExternalFormSubmit'] = 0.0
+    features['HasSocialNet'] = 0.0
+    features['HasSubmitButton'] = 0.0
+    features['HasHiddenFields'] = 0.0
+    features['HasPasswordField'] = 0.0
+    features['HasCopyrightInfo'] = 0.0
+
     try:
-        try:
-            w = whoisdomain.query(domain)
-        except Exception as whois_err:
-            print(f"[!] WHOIS query failed for {domain}: {whois_err}")
-            # Set neutral/safe defaults instead of -1 to avoid bias
-            features['Domain_registeration_length'] = 0  # Neutral
-            features['age_of_domain'] = 0  # Neutral
-            features["country"] = 0  # Neutral
-            features["org"] = 0  # Neutral
-            w = None
-        
-        if w is not None:
-            # Try to get WHOIS data safely
-            features["country"] = getattr(w, 'registrant_country', "Unknown")
-            features["org"] = getattr(w, 'registrar', "Unknown")
+        async with httpx.AsyncClient(timeout=3.0, follow_redirects=True,
+                                     headers={"User-Agent": "Mozilla/5.0"}) as client:
+            response = await client.get(url)
+            html = response.text.lower()
+            soup = BeautifulSoup(response.text, 'html.parser')
             
-            try:
-                creation_date = get_first_date(w.creation_date)
-                expiration_date = get_first_date(w.expiration_date)
+            features['NoOfURLRedirect'] = len(response.history)
+            
+            if soup.title and soup.title.string:
+                features['HasTitle'] = 1.0
+            if soup.find('link', rel=lambda v: v and 'icon' in v.lower()):
+                features['HasFavicon'] = 1.0
+            if soup.find('meta', attrs={'name': 'robots'}):
+                features['Robots'] = 1.0
+            if soup.find('meta', attrs={'name': 'viewport'}):
+                features['IsResponsive'] = 1.0
+            if soup.find('meta', attrs={'name': 'description'}):
+                features['HasDescription'] = 1.0
                 
-                if creation_date and expiration_date:
-                    # Domain registration length
-                    remaining_days = _domain_remaining_days(expiration_date)
-                    features['Domain_registeration_length'] = 1 if remaining_days > 365 else -1
-                    
-                    # Domain age
-                    age_days = _domain_age_days(creation_date)
-                    features['age_of_domain'] = 1 if age_days >= 182 else -1
-                else:
-                    features['Domain_registeration_length'] = 0  # Neutral
-                    features['age_of_domain'] = 0  # Neutral
-            except Exception as date_err:
-                print(f"[!] Error parsing WHOIS dates: {date_err}")
-                features['Domain_registeration_length'] = 0  # Neutral
-                features['age_of_domain'] = 0  # Neutral
+            features['NoOfPopup'] = 1.0 if 'window.open' in html or 'alert(' in html else 0.0
+            features['NoOfiFrame'] = 1.0 if soup.find('iframe') else 0.0
             
+            forms = soup.find_all('form')
+            for form in forms:
+                action = form.get('action', '').lower()
+                if action and not action.startswith('/') and domain not in action:
+                    features['HasExternalFormSubmit'] = 1.0
+                    break
+            
+            socials = ['facebook.com', 'twitter.com', 'instagram.com', 'linkedin.com']
+            if any(s in html for s in socials):
+                features['HasSocialNet'] = 1.0
+                
+            if soup.find('input', type='submit') or soup.find('button', type='submit'):
+                features['HasSubmitButton'] = 1.0
+            if soup.find('input', type='hidden'):
+                features['HasHiddenFields'] = 1.0
+            if soup.find('input', type='password'):
+                features['HasPasswordField'] = 1.0
+            if 'copyright' in html or '©' in html:
+                features['HasCopyrightInfo'] = 1.0
+
     except Exception as e:
-        print(f"[!] Unexpected error in WHOIS processing: {e}")
-        features['Domain_registeration_length'] = 0  # Neutral
-        features['age_of_domain'] = 0  # Neutral
-        features["country"] = "Unknown"  # Neutral
-        features["org"] = "Unknown"  # Neutral
+        print(f"[!] Error fetching {url}: {e} -> Using neutral content features")
 
-    # DNS Record
+    # Filter only required features to ensure exact match with model
+    final_features = {k: float(features.get(k, 0.0)) for k in REQUIRED_FEATURES}
+    _feature_cache[cache_key] = final_features
+    return final_features
+
+
+# ============================================================================
+# HEURISTIC ENGINE (Real-time Engineering)
+# ============================================================================
+
+def heuristic_phishing_score(url: str, features_dict: Dict) -> float:
+    """
+    Heuristic engine cập nhật 2024 (Dựa trên recommendation):
+    1. HTTP thuần = RED FLAG nặng (+40)
+    2. Levenshtein Brand Distance (Typosquatting) = RED FLAG (+30)
+    3. TLD rủi ro cao = RED FLAG (+20)
+    """
+    score = 0
+    parsed = urlparse(url)
+    domain = parsed.netloc.lower()
+    ext = tldextract.extract(url)
+
+    # 1. HTTP = Bad
+    if features_dict.get('IsHTTPS', 1.0) == 0.0:
+        score += 40
+
+    # 2. Typosquatting (Levenshtein distance)
+    # Neu domain gan giong brand noi tieng nhung khong phai brand do
+    domain_name = ext.domain
+    is_typo = False
+    if domain_name not in TOP_50_BRANDS:  # Neu chinh la brand thi ok
+        for brand in TOP_50_BRANDS:
+            dist = Levenshtein.distance(domain_name, brand)
+            if dist == 1 or (dist == 2 and len(brand) > 5):
+                is_typo = True
+                break
+    if is_typo:
+        score += 30
+
+    # 3. Risky TLD
+    if ext.suffix in SUSPICIOUS_TLDS:
+        score += 20
+
+    # 4. Shortener
+    if re.search(r"bit\.ly|goo\.gl|tinyurl\.com|ow\.ly|t\.co", domain):
+        score += 20
+
+    return min(100, score)
+
+
+# ============================================================================
+# RED FLAGS (SHAP-based Explanations)
+# ============================================================================
+
+def generate_red_flags(url: str, features_dict: Dict, model_proba: float) -> List[str]:
+    flags = []
+    
+    # 1. Heuristic hard flags
+    if features_dict.get('IsHTTPS', 1.0) == 0.0:
+        flags.append("Trang web không sử dụng HTTPS (Rất nguy hiểm)")
+    
+    ext = tldextract.extract(url)
+    if ext.suffix in SUSPICIOUS_TLDS:
+        flags.append(f"Sử dụng tên miền cấp cao rủi ro (.{ext.suffix})")
+
+    domain_name = ext.domain
+    if domain_name not in TOP_50_BRANDS:
+        for brand in TOP_50_BRANDS:
+            dist = Levenshtein.distance(domain_name, brand)
+            if dist == 1 or (dist == 2 and len(brand) > 5):
+                flags.append(f"Tên miền nhái thương hiệu '{brand}' (Typosquatting)")
+                break
+
+    # 2. SHAP Model Explanations
     try:
-        socket.gethostbyname(domain)
-        features['DNSRecord'] = 1  # Domain resolved successfully
-    except Exception as dns_err:
-        # Set neutral instead of suspicious when DNS check fails
-        # This allows URL structure analysis to make the decision
-        features['DNSRecord'] = 0
-        print(f"⚠️  DNS check inconclusive for {domain}: {type(dns_err).__name__}")
-
-    # Store whether we could fetch page content (for reporting)
-    features['_content_fetched'] = content_fetched
-    
-    print(f"    Extracted features: {features['country']}, {features['org']}")
-    return features
-
-
-def get_risk_report(url: str, features_dict: Dict) -> Dict:
-    """
-    Tính risk report kết hợp:
-    1. ML Model probability (từ Random Forest)
-    2. Heuristic-based score (rule-based detection)
-    3. Red flags từ features
-    
-    Hybrid approach: khi model không confident, rule-based sẽ compensate
-    Whitelist prioritization: nếu domain trong whitelist, return SAFE ngay
-    """
-    
-    # Check if we could fetch page content
-    content_fetched = features_dict.pop('_content_fetched', True)
-    
-    # === WHITELIST FAST-TRACK ===
-    # Nếu domain trong whitelist legitimate, return SAFE immediately
-    domain = urlparse(url).netloc.lower()
-    for legit_domain in LEGITIMATE_DOMAINS:
-        if domain == legit_domain or domain.endswith('.' + legit_domain):
-            print(f"    [OK] Whitelisted domain detected - returning SAFE")
-            # Return safe report for whitelisted domains
-            return {
-                "risk_score": 5.0,  # Very low risk
-                "confidence": 99.0,
-                "is_phishing": False,
-                "phishing_probability": 0.1,
-                "legitimate_probability": 99.9,
-                "ml_score": 5.0,
-                "heuristic_score": 0.0,
-                "model_confidence": 0.0,
-                "red_flags": [],
-                "level": "SAFE",
-                "color": "Green",
-                "model_prediction": "Legitimate",
-                "hybrid_prediction": "Legitimate",
-                "content_fetched": content_fetched,
-                "scoring_method": "Whitelist Match (100% Safe)",
-                "note": f"Domain '{domain}' is in trusted whitelist"
-            }
-    
-    # Chuẩn bị features theo đúng thứ tự
-    input_features = [features_dict[name] for name in REQUIRED_FEATURES]
-    input_df = pd.DataFrame([input_features], columns=REQUIRED_FEATURES)
-    
-    # === APPROACH 1: ML Model Score ===
-    prediction = model.predict(input_df)[0]  # 0=Legitimate, 1=Phishing
-    proba = model.predict_proba(input_df)[0]  # [prob_legitimate, prob_phishing]
-    
-    # Model confidence (how sure is the model?)
-    model_confidence = abs(proba[1] - proba[0])  # 0-1 scale
-    
-    # ML Risk score
-    ml_risk_score = proba[1] * 100  # Phishing probability (0-100)
-    
-    # === APPROACH 2: Heuristic-Based Score ===
-    heuristic_score = heuristic_phishing_score(url, features_dict)
-    
-    # === HYBRID SCORE ===
-    # When model is confident (model_confidence > 0.7), trust model more
-    # When model is not confident (model_confidence < 0.3), trust heuristic more
-    confidence_weight = min(1.0, model_confidence * 1.5)  # Scale 0-1.5 → 0-1
-    
-    risk_score = (ml_risk_score * confidence_weight) + (heuristic_score * (1 - confidence_weight))
-    
-    confidence = proba[prediction] * 100
-    
-    print(f"    >> ML score: {ml_risk_score:.1f}%, Heuristic: {heuristic_score:.1f}%, Model confidence: {model_confidence:.2f}")
-
-    red_flags = []
-    
-    # Analyze features
-    if features_dict.get('having_IPhaving_IP_Address') == -1:
-        red_flags.append("Direct IP address in URL (suspicious)")
-    
-    if features_dict.get('Shortining_Service') == -1:
-        red_flags.append("URL shortener detected (bit.ly, tinyurl...) - requires verification")
-    
-    if features_dict.get('SSLfinal_State') == -1:
-        red_flags.append("No HTTPS/SSL certificate")
-    
-    if features_dict.get('Prefix_Suffix') == -1:
-        red_flags.append("Hyphen (-) in domain name")
-    
-    if features_dict.get('age_of_domain') == -1:
-        red_flags.append("Domain recently registered (< 6 months old)")
-    
-    if features_dict.get('having_Sub_Domain') == -1:
-        red_flags.append("Multiple sub-domains detected")
-    
-    if features_dict.get('Redirect') == -1:
-        red_flags.append("Multiple redirects detected")
-    
-    if features_dict.get('Iframe') == -1:
-        red_flags.append("Contains iframe (iframe tag)")
-    
-    if features_dict.get('SFH') == -1:
-        red_flags.append("Form submission to invalid target")
-
-    # Classify risk level based on statistical thresholds
-    # (Not arbitrary thresholds, but based on model performance)
-    if risk_score >= 90:
-        level = "EXTREMELY DANGEROUS"
-        color = "Red"
-    elif risk_score >= 75:
-        level = "DANGEROUS"
-        color = "Orange"
-    elif risk_score >= 60:
-        level = "WARNING"
-        color = "Yellow"
-    elif risk_score >= 40:
-        level = "CAUTION"
-        color = "Light Yellow"
-    else:
-        level = "SAFE"
-        color = "Green"
-    
-    return {
-        "risk_score": round(risk_score, 2),
-        "confidence": round(confidence, 2),
-        "is_phishing": bool(risk_score >= 50),  # Threshold at 50%
-        "phishing_probability": round(proba[1] * 100, 2),
-        "legitimate_probability": round(proba[0] * 100, 2),
-        "ml_score": round(ml_risk_score, 2),
-        "heuristic_score": round(heuristic_score, 2),
-        "model_confidence": round(model_confidence, 2),
-        "red_flags": red_flags,
-        "level": level,
-        "color": color,
-        "model_prediction": "Phishing" if prediction == 1 else "Legitimate",
-        "hybrid_prediction": "Phishing" if risk_score >= 50 else "Legitimate",
-        "content_fetched": content_fetched,
-        "scoring_method": f"Hybrid (ML: {confidence_weight*100:.0f}%, Rules: {(1-confidence_weight)*100:.0f}%)",
-        "note": "Based on URL structure only (page content not accessible)" if not content_fetched else "Based on full analysis (URL + page content)"
-    }
-
-
-# ============================================================================
-# TESTING
-# ============================================================================
-
-async def main():
-    """Test the improved predictor"""
-    
-    test_urls = [
-        # Legitimate URLs
-        "https://www.google.com",
-        "https://www.youtube.com",
-        "https://www.facebook.com",
-        
-        # Suspicious URLs
-        "https://google-secure-login.xyz/verify",
-        "https://amazon-account.tk/login",
-        "https://bit.ly/4cNp5bV",
-    ]
-
-    print("="*60)
-    print("IMPROVED PHISHING DETECTION SYSTEM (Hybrid ML + Rules)")
-    print("="*60)
-
-    for url in test_urls:
-        try:
-            features = await extract_features_async(url)
-            report = get_risk_report(url, features)
-
-            print(f"\n{'='*60}")
-            print(f"URL: {url}")
-            print(f"{'='*60}")
-            print(f"[RESULT] Final Prediction: {report['hybrid_prediction']}")
-            print(f"[RISK] Level: {report['level']} ({report['color']})")
-            print(f"[SCORE] Risk Score: {report['risk_score']}%")
-            print(f"\nScoring Details:")
-            print(f"  - ML Model Score: {report['ml_score']}%")
-            print(f"  - Rule-Based Score: {report['heuristic_score']}%")
-            print(f"  - Scoring Method: {report['scoring_method']}")
-            print(f"  - Model Confidence: {report['model_confidence']:.2f}")
-            print(f"  - Phishing probability: {report['phishing_probability']}%")
-            print(f"  - Legitimate probability: {report['legitimate_probability']}%")
+        explainer = _get_shap_explainer()
+        if explainer and model_proba >= OPTIMAL_THRESHOLD:
+            import pandas as pd
+            import numpy as np
+            # Convert to correct shape
+            df_single = pd.DataFrame([features_dict], columns=REQUIRED_FEATURES)
+            sv = explainer.shap_values(df_single)
             
-            # Add note about analysis type
-            if not report['content_fetched']:
-                print(f"\n[WARNING] {report['note']}")
-            
-            if report['red_flags']:
-                print(f"\n[FLAGS] Red Flags ({len(report['red_flags'])} detected):")
-                for flag in report['red_flags']:
-                    print(f"   - {flag}")
+            # Extract SHAP values (handle different SHAP return types)
+            if isinstance(sv, list):
+                shap_vals = sv[1][0]
+            elif len(sv.shape) == 3:
+                shap_vals = sv[0, :, 1]
             else:
-                print(f"\n[OK] No major red flags detected")
+                shap_vals = sv[0]
                 
-        except Exception as e:
-            print(f"\n[!] Error processing {url}: {e}")
+            # Get top 2 features pushing score towards phishing
+            top_indices = np.argsort(shap_vals)[-2:][::-1]
+            for idx in top_indices:
+                if shap_vals[idx] > 0.5: # Chi lay nhung feature dong gop dang ke
+                    feat_name = REQUIRED_FEATURES[idx]
+                    val = features_dict[feat_name]
+                    
+                    if feat_name == 'URLLength' and val > 75:
+                        flags.append("Độ dài URL bất thường (cố tình che giấu)")
+                    elif feat_name == 'IsDomainIP' and val == 1.0:
+                        flags.append("Sử dụng địa chỉ IP thay vì tên miền")
+                    elif feat_name == 'NoOfSubDomain' and val > 2:
+                        flags.append("Có quá nhiều subdomains (đánh lừa người dùng)")
+                    elif feat_name == 'HasPasswordField' and val == 1.0:
+                        flags.append("Trang web yêu cầu mật khẩu không đáng tin")
+    except Exception as e:
+        print(f"[!] SHAP Error in red_flags: {e}")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    # Fallback default nếu không có cờ nào
+    if not flags and model_proba >= OPTIMAL_THRESHOLD:
+        flags.append("Cấu trúc URL có độ rủi ro cao")
+        
+    return list(dict.fromkeys(flags)) # Remove duplicates
+
+
+# ============================================================================
+# MAIN PREDICT FUNCTION
+# ============================================================================
+
+async def predict_phishing(url: str) -> Dict:
+    url = url.strip()
+    if not url.startswith(('http://', 'https://')):
+        url = 'http://' + url
+
+    # 1. Whitelist Check
+    if _is_whitelisted(url):
+        return {
+            "url": url,
+            "phishing_probability": 0.0,
+            "is_phishing": False,
+            "heuristic_score": 0,
+            "red_flags": [],
+            "status": "success",
+            "model_version": "Whitelist"
+        }
+
+    try:
+        # 2. Extract Features
+        features_dict = await extract_features_async(url)
+        
+        import pandas as pd
+        df = pd.DataFrame([features_dict], columns=REQUIRED_FEATURES)
+
+        # 3. Model Prediction
+        y_proba = float(model.predict_proba(df)[0, 1])
+        is_phish_ml = y_proba >= OPTIMAL_THRESHOLD
+
+        # 4. Heuristic Prediction
+        h_score = heuristic_phishing_score(url, features_dict)
+        is_phish_h = h_score >= 60
+
+        # 5. Hybrid Decision (OR logic for security)
+        is_phishing = is_phish_ml or is_phish_h
+        
+        # 6. Explanations
+        red_flags = generate_red_flags(url, features_dict, y_proba)
+
+        return {
+            "url": url,
+            "phishing_probability": y_proba,
+            "is_phishing": is_phishing,
+            "heuristic_score": h_score,
+            "red_flags": red_flags,
+            "status": "success",
+            "model_version": "v2.2 (PhiUSIIL Clean)"
+        }
+
+    except Exception as e:
+        print(f"[!] Prediction error for {url}: {e}")
+        return {
+            "url": url,
+            "error": str(e),
+            "status": "error"
+        }

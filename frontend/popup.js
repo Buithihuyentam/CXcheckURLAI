@@ -4,6 +4,8 @@ const CONFIG = {
   MAX_DISPLAY_LENGTH: 25,
 };
 
+let list = null;
+
 let state = {
   activeTabUrl: "",
   allData: [],
@@ -12,6 +14,7 @@ let state = {
 
 // --- KHỞI TẠO ---
 document.addEventListener("DOMContentLoaded", () => {
+  list = document.getElementById("linkList");
   App.init();
 });
 
@@ -49,7 +52,9 @@ const App = {
     // Luôn gửi kèm tabId (nếu có) để background biết chắc chắn lấy ở đâu
     chrome.runtime.sendMessage({ action: "GET_SCANNED_DATA" }, (response) => {
       if (response?.allData) {
+        console.log(`📥 Nhận ${response.allData} link đã quét từ Background`);
         state.allData = response.allData;
+        console.log(`📥 1 Nhận ${state.allData} link đã quét từ Background`);
         UI.refreshList();
       }
     });
@@ -155,11 +160,11 @@ const App = {
     }
   },
 };
+
 // --- GIAO DIỆN (UI) ---
 const UI = {
   refreshList() {
     const loader = document.getElementById("loading");
-    const list = document.getElementById("linkList");
 
     if (state.allData.length > 0) {
       if (loader) loader.style.display = "none";
@@ -169,7 +174,6 @@ const UI = {
   },
 
   clearList() {
-    const list = document.getElementById("linkList");
     const loader = document.getElementById("loading");
     if (list) list.innerHTML = "";
     if (loader) {
@@ -179,21 +183,18 @@ const UI = {
   },
 
   renderCard(item) {
-    const list = document.getElementById("linkList");
-
     // 1. Mapping màu sắc & Icon đồng bộ
     const colorMap = {
       Green: { hex: "#2ecc71", icon: "✅" },
-      "Light Green": { hex: "#a2d149", icon: "✅" },
+      "Light Yellow": { hex: "#a2d149", icon: "✅" },
       Yellow: { hex: "#f1c40f", icon: "⚠️" },
       Orange: { hex: "#e67e22", icon: "🚫" },
       Red: { hex: "#e74c3c", icon: "🚫" },
     };
-
-    const statusConfig = colorMap[item.color];
+    console.log("🔍 Render card for URL:", item.url, "with color:", item.color);
+    const statusConfig = colorMap[item.color] || { hex: "#95a5a6", icon: "❓" };
     const baseColor = statusConfig.hex;
     const isDarkText = item.color === "Yellow"; // Chữ đen trên nền vàng cho dễ đọc
-
     const displayUrl = item.meta_url || "Unknown URL";
     const shortUrl =
       displayUrl.length > 50 ? displayUrl.substring(0, 50) + "..." : displayUrl;
@@ -219,7 +220,7 @@ const UI = {
         </div>
         <div class="detail-row">
             <span>📊 Safety Score:</span> 
-            <b>${item.score || "N/A"}%</b>
+            <b>${item.risk_score || "N/A"}%</b>
         </div>
         <div class="detail-row">
             <span>📍 Country:</span> 
@@ -245,7 +246,7 @@ const UI = {
         </div>
         
         <div class="detail-link" style="margin-top: 15px; display: flex; justify-content: flex-end;">
-          <a href="${item.url}" target="_blank" style="color: ${baseColor}; text-decoration: none; font-weight: bold; margin-top: 5px;">Visit Link ↗</a>
+          <a href="${item.final_url}" target="_blank" style="color: ${baseColor}; text-decoration: none; font-weight: bold; margin-top: 5px;">Visit Link ↗</a>
           <button type="button" class="btn btn-sm view-post-btn" style="background-color: ${baseColor}; color: ${isDarkText ? "#333" : "#fff"}; margin-left: 15px; border: none; padding: 5px 15px; border-radius: 4px; font-weight: bold;">
             View post
           </button>

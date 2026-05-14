@@ -9,20 +9,6 @@ const CheckPost = {
     SCAN_DEBOUNCE_MS: 600,
     MAX_BATCH_SIZE: 30,
     LINK_SELECTOR: 'article[data-testid="tweet"] a[href*="t.co"]',
-    SAFE_DOMAINS: new Set([
-      "google.com",
-      "youtube.com",
-      "facebook.com",
-      "linkedin.com",
-      "wikipedia.org",
-    ]),
-    SHORTENERS: new Set([
-      "bit.ly",
-      "t.co",
-      "tinyurl.com",
-      "goo.gl",
-      "bitly.com",
-    ]),
   },
 
   // --- TRẠNG THÁI ---
@@ -160,17 +146,32 @@ const CheckPost = {
 
     el.classList.remove("cp-scan-loading");
     const isPhish = data.is_phishing;
-    const isWarning = data.level?.includes("NGHI NGỜ");
+    const isWarning = data.level?.includes("WARNING");
+    const isDanger =
+      data.level === "EXTREMELY DANGEROUS" || data.level === "DANGEROUS";
+    let bgColor = "";
+    let borderColor = "";
 
+    // 2. Dùng if...else if để gán giá trị theo điều kiện
+    if (isPhish && isDanger) {
+      bgColor = "rgba(255, 71, 87, 0.15)";
+      borderColor = "#ff4757";
+    } else if (isWarning) {
+      bgColor = "rgba(255, 165, 0, 0.15)";
+      borderColor = "#ffa500";
+    } else {
+      // Safe -> Màu Xanh
+      bgColor = "rgba(46, 204, 113, 0.12)";
+      borderColor = "#2ed573";
+    }
     Object.assign(el.style, {
-      backgroundColor: isPhish
-        ? "rgba(255, 71, 87, 0.15)"
-        : isWarning
-          ? "rgba(255, 165, 0, 0.15)"
-          : "rgba(46, 204, 113, 0.12)",
-      borderBottom: `2px solid ${isPhish ? "#ff4757" : isWarning ? "#ffa500" : "#2ed573"}`,
+      backgroundColor: bgColor,
+      borderBottom: `2px solid ${borderColor}`,
       transition: "all 0.3s ease",
     });
+    console.log(
+      `Link ${data.url} được đánh dấu là ${isPhish ? "Phishing" : "Safe"}`,
+    );
 
     el.dataset.checkpostStatus = "done";
     this.state.processedLinks.add(el);
@@ -184,11 +185,6 @@ const CheckPost = {
       link.dataset.checkpostStatus
     )
       return;
-
-    if (this.isSafe(link.href)) {
-      this.applyHighlight(link, { is_phishing: false });
-      return;
-    }
 
     this.state.pendingUrls.add(link.href);
     link.classList.add("cp-scan-loading");
@@ -219,18 +215,18 @@ const CheckPost = {
     chrome.runtime.sendMessage({ action: "AUTO_SCAN", urls: batch }, (res) => {
       this.updateRadar(-batch.length);
       if (!res?.results) return;
-
+      console.log(`Nhận kết quả cho batch ${batch.length}:`, res.results);
       res.results.forEach((item) => {
+        console.log(`Processing result for URL: ${item}`);
         this.state.localCache.set(item.url, item);
-        if (item.original_url)
-          this.state.localCache.set(item.original_url, item);
         this.markDomElements(item);
       });
     });
   },
 
   markDomElements(item) {
-    const urls = [item.url, item.original_url].filter(Boolean);
+    const urls = [item.url].filter(Boolean);
+    console.log("Marking URLs in DOM:", urls);
     urls.forEach((u) => {
       document
         .querySelectorAll(`a[href="${CSS.escape(u)}"]`)
@@ -297,8 +293,6 @@ const CheckPost = {
     chrome.runtime.sendMessage({ action: "GET_SCANNED_DATA" }, (res) => {
       res?.allData?.forEach((item) => {
         this.state.localCache.set(item.url, item);
-        if (item.original_url)
-          this.state.localCache.set(item.original_url, item);
         this.markDomElements(item);
       });
     });
@@ -406,7 +400,7 @@ const CheckPost = {
         if (res?.success) {
           const details = res.data.details || {};
           const isPhish = res.data.is_phishing;
-          const trustScore = details.score;
+          const trustScore = details.risk_score || 0;
 
           tip.innerHTML = `
                 <div class="cp-tooltip-header">

@@ -162,7 +162,7 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
 
     try {
       const res = await fetch(
-        `${CONFIG.SERVER_URL}phishing?url=${encodeURIComponent(currentUrl)}`,
+        `${CONFIG.SERVER_URL}analyze?url=${encodeURIComponent(currentUrl)}`,
       );
       const data = await res.json();
 
