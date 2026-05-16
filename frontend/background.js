@@ -66,6 +66,27 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             .catch(() => {});
           break;
 
+        case "RESTORE_CACHE":
+          if (!sender.tab?.id) return;
+          await saveResultsToStorage(sender.tab.id, message.results);
+          chrome.runtime
+            .sendMessage({ action: "UPDATE_POPUP_UI", newResults: message.results })
+            .catch(() => {});
+          break;
+        case "UPDATE_BADGE":
+          if (sender.tab?.id) {
+            chrome.action.setBadgeText({
+              text: message.count > 0 ? message.count.toString() : "",
+              tabId: sender.tab.id,
+            });
+            chrome.action.setBadgeBackgroundColor({
+              color: "#3498db",
+              tabId: sender.tab.id,
+            });
+          }
+          sendResponse({ success: true });
+          break;
+
         case "GET_SCANNED_DATA":
           // Nếu tin nhắn gửi từ một tab, dùng tabId đó.
           // Nếu gửi từ Popup, ta mới cần query tab active.
@@ -102,6 +123,32 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           );
           const singleData = await singleRes.json();
           sendResponse({ success: true, data: singleData });
+          break;
+
+        case "REPORT_URL":
+          const reportRes = await fetch(`${CONFIG.SERVER_URL}report`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              url: message.url,
+              reason: message.reason || "User reported from extension",
+            }),
+          });
+          const reportData = await reportRes.json();
+          sendResponse({ success: true, data: reportData });
+          break;
+
+        case "REPORT_MISTAKE":
+          const mistakeRes = await fetch(`${CONFIG.SERVER_URL}report_mistake`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              url: message.url,
+              reason: message.reason || "User reported mistake from extension",
+            }),
+          });
+          const mistakeData = await mistakeRes.json();
+          sendResponse({ success: true, data: mistakeData });
           break;
 
         case "ALLOW_ACCESS":
@@ -142,41 +189,41 @@ chrome.tabs.onUpdated.addListener(async (tabId, changeInfo, tab) => {
     chrome.runtime.sendMessage({ action: "CLEAR_POPUP_UI" }).catch(() => {});
   }
 
-  // 2. Chốt chặn Phishing trang chính khi load xong
-  if (changeInfo.status === "complete") {
-    const currentUrl = tab.url;
-    if (
-      !currentUrl ||
-      !currentUrl.startsWith("http") ||
-      currentUrl.includes("override.html")
-    )
-      return;
-
-    // Kiểm tra Whitelist
-    const allowKey = `allowed_${tabId}`;
-    const allowed = await chrome.storage.local.get([allowKey]);
-    if (allowed[allowKey] === currentUrl) return;
-
-    const settings = await chrome.storage.local.get(["checkPostState"]);
-    if (settings.checkPostState === "unchecked") return;
-
-    try {
-      const res = await fetch(
-        `${CONFIG.SERVER_URL}analyze?url=${encodeURIComponent(currentUrl)}`,
-      );
-      const data = await res.json();
-
-      if (data.is_phishing) {
-        const warningUrl =
-          chrome.runtime.getURL("override.html") +
-          "?url=" +
-          encodeURIComponent(currentUrl);
-        chrome.tabs.update(tabId, { url: warningUrl });
-      }
-    } catch (e) {
-      console.error("Real-time Protection Error:", e);
-    }
-  }
+  // Chốt chặn Phishing trang chính khi load xong
+  // if (changeInfo.status === "complete") {
+  //   const currentUrl = tab.url;
+  //   if (
+  //     !currentUrl ||
+  //     !currentUrl.startsWith("http") ||
+  //     currentUrl.includes("override.html")
+  //   )
+  //     return;
+  //
+  //   // Kiểm tra Whitelist
+  //   const allowKey = `allowed_${tabId}`;
+  //   const allowed = await chrome.storage.local.get([allowKey]);
+  //   if (allowed[allowKey] === currentUrl) return;
+  //
+  //   const settings = await chrome.storage.local.get(["checkPostState"]);
+  //   if (settings.checkPostState === "unchecked") return;
+  //
+  //   try {
+  //     const res = await fetch(
+  //       `${CONFIG.SERVER_URL}analyze?url=${encodeURIComponent(currentUrl)}`,
+  //     );
+  //     const data = await res.json();
+  //
+  //     if (data.is_phishing) {
+  //       const warningUrl =
+  //         chrome.runtime.getURL("override.html") +
+  //         "?url=" +
+  //         encodeURIComponent(currentUrl);
+  //       chrome.tabs.update(tabId, { url: warningUrl });
+  //     }
+  //   } catch (e) {
+  //     console.error("Real-time Protection Error:", e);
+  //   }
+  // }
 });
 
 // --- CONTEXT MENUS ---

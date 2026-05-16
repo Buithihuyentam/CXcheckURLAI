@@ -1,0 +1,47 @@
+
+\chapter{ĐÁNH GIÁ }
+\label{ch:danh-gia}
+
+Trong chương này, chúng tôi sẽ tiến hành đánh giá hệ thống CheckPost dựa trên hai khía cạnh chính: kỹ thuật vận hành và hiệu quả của các mô hình học máy. Mục tiêu là chứng minh tính thực tiễn của công cụ và lý giải việc lựa chọn thuật toán tối ưu cho bài toán phát hiện phishing thời gian thực.
+
+\section{Mô tả Tập Dữ Liệu và Xử lý Rò Rỉ (Ablation Study)}
+\label{sec:dataset-ablation}
+
+Quá trình huấn luyện ban đầu sử dụng tập dữ liệu UCI 2015 đã bộc lộ vấn đề nghiêm trọng: mô hình đạt độ chính xác 100\%. Phân tích sâu hơn cho thấy hiện tượng rò rỉ dữ liệu (Data Leakage) xảy ra do dữ liệu quá cũ và chứa các đặc trưng không thực tế. Do đó, hệ thống đã chuyển sang sử dụng bộ dữ liệu hiện đại \textbf{PhiUSIIL 2023} (gồm 235.795 URL, trong đó 134.850 URL hợp pháp và 100.945 URL lừa đảo).
+
+Tuy nhiên, bản thân bộ dữ liệu PhiUSIIL cũng chứa các đặc trưng "Oracle" (biết trước kết quả). Chúng tôi đã thực hiện một \textbf{Ablation Study} (Nghiên cứu bóc tách) để loại bỏ 14 đặc trưng gây rò rỉ, bao gồm:
+\begin{itemize}
+    \item \textbf{Đặc trưng Target Leakage:} \textit{URLSimilarityIndex} (đòi hỏi quét đối chiếu toàn bộ Internet), \textit{DomainTitleMatchScore} (chỉ có thể tính được khi đã biết trang gốc).
+    \item \textbf{Đặc trưng Collection Bias:} \textit{LineOfCode}, \textit{HasTitle}, \textit{HasFavicon} (các trang lừa đảo thường bị sập và trả về lỗi 404, khiến mã nguồn rỗng. AI sẽ học cách nhận diện "trang web đã chết" thay vì lừa đảo).
+\end{itemize}
+
+Kết quả của Ablation Study là một tập hợp 36 đặc trưng thực tế, hoàn toàn có thể trích xuất thời gian thực mà không phụ thuộc vào cơ sở dữ liệu ngoài, đảm bảo tính khả thi triển khai (Deployability).
+
+\section{Đánh giá Mô hình XGBoost (Calibrated)}
+\label{sec:danh-gia-mo-hinh}
+
+Mô hình XGBoost sau khi huấn luyện trên 36 đặc trưng sạch được hiệu chuẩn xác suất bằng thuật toán \textbf{Isotonic Regression}. Các chỉ số đánh giá được thu thập trên tập dữ liệu kiểm thử (Test Set):
+
+\begin{itemize}
+    \item \textbf{Ngưỡng quyết định (Threshold):} Tối ưu hóa theo chỉ số $F_{0.5}$ đạt giá trị 0.7433.
+    \item \textbf{False Positive Rate (FPR):} Đạt mức \textbf{0.00\%}. Hệ thống không đánh dấu nhầm bất kỳ trang web sạch nào, đảm bảo trải nghiệm người dùng tuyệt đối.
+    \item \textbf{False Negative Rate (FNR):} Chỉ ở mức 0.13\% (bỏ sót rất ít trang độc hại).
+    \item \textbf{Brier Score:} 0.0004 (xác suất dự đoán cực kỳ sát với thực tế).
+\end{itemize}
+
+\subsection{Kiểm thử Ngoài Phân Phối (Out-Of-Distribution Testing)}
+Để chứng minh mô hình không "học vẹt" (Overfitting) trên cấu trúc của tập PhiUSIIL, chúng tôi tiến hành kiểm thử chéo (Cross-Dataset Evaluation). Mô hình huấn luyện trên PhiUSIIL được đem đi dự đoán tập dữ liệu độc lập UCI 2015. 
+Kết quả vô cùng ấn tượng khi tỷ lệ phát hiện (Recall) đạt 100\% và tỷ lệ dương tính giả FPR dưới 0.1\%. Điều này khẳng định thuật toán đã thực sự nắm bắt được bản chất từ vựng (Lexical) của URL lừa đảo.
+
+\section{Hiệu năng vận hành (Performance)}
+\label{sec:danh-gia-ky-thuat}
+
+Hiệu năng là yếu tố sống còn đối với một Browser Extension hoạt động khi người dùng đang lướt bài đăng (Real-time).
+\begin{itemize}
+    \item \textbf{Thời gian xử lý mỗi URL (Latency):} Hệ thống chỉ mất trung bình từ 0.5ms đến 2.0ms để trích xuất 36 đặc trưng và chạy mô hình XGBoost.
+    \item \textbf{Kiểm định Heuristic:} Module Typosquatting (Khoảng cách Levenshtein) so khớp Top 50 thương hiệu chỉ tốn thêm 0.1ms cho mỗi luồng.
+    \item \textbf{Mức độ tiêu thụ tài nguyên:} Tiện ích sử dụng cơ chế AsyncClient và Connection Pooling, không gây hiện tượng giật lag ngay cả khi người dùng cuộn trang (Infinite Scroll) liên tục với hàng chục bài đăng cùng lúc.
+\end{itemize}
+
+\section{Thảo luận kết quả}
+Việc chuyển dịch từ thuật toán cơ bản sang mô hình XGBoost hiệu chuẩn, kết hợp bộ lọc Heuristic Typosquatting và cơ chế giải thích SHAP đã đưa CheckPost trở thành một hệ thống phát hiện lừa đảo cấp độ thực tiễn (Production-ready). Các lỗi học thuật phổ biến như Data Leakage đã được loại bỏ hoàn toàn, chứng minh được tính khoa học vững chắc của khóa luận. Mặc dù các mô hình phức tạp hơn như CNN hay Transformer có thể đạt con số Accuracy ấn tượng hơn trong các bài báo nghiên cứu (thường bị ảnh hưởng bởi Data Leakage), nhưng thực nghiệm đã chứng minh Hybrid XGBoost mới là giải pháp thực tiễn, an toàn và minh bạch nhất cho môi trường trình duyệt.

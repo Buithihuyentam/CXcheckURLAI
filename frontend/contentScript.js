@@ -1,12 +1,8 @@
-/**
- * CHECKPOST - Hệ thống Radar bảo vệ thời gian thực
- * Chuyên nghiệp hóa cho Khóa luận tốt nghiệp
- */
 
 const CheckPost = {
   // --- CẤU HÌNH ---
   CONFIG: {
-    SCAN_DEBOUNCE_MS: 600,
+    SCAN_DEBOUNCE_MS: 300,
     MAX_BATCH_SIZE: 30,
     LINK_SELECTOR: 'article[data-testid="tweet"] a[href*="t.co"]',
   },
@@ -16,7 +12,7 @@ const CheckPost = {
     localCache: new Map(),
     pendingUrls: new Set(),
     processedLinks: new WeakSet(),
-    activeScansCount: 0,
+    totalLinksCount: 0,
     lastUrl: location.href,
     scanTimer: null,
     currentFloatingBtn: null,
@@ -26,7 +22,6 @@ const CheckPost = {
   init() {
     console.log("🛡️ CheckPost Scanner Engine starting...");
     this.injectStyles();
-    this.initUI();
     this.initEvents();
     this.syncWithStorage();
     this.startObservers();
@@ -105,12 +100,6 @@ const CheckPost = {
     document.head.appendChild(style);
   },
 
-  initUI() {
-    this.radar = document.createElement("div");
-    this.radar.id = "cp-radar";
-    this.radar.innerHTML = `<div class="cp-ping"></div><span id="cp-radar-count">0</span>`;
-    document.body.appendChild(this.radar);
-  },
 
   // --- LOGIC XỬ LÝ DỮ LIỆU ---
   getHost(url) {
@@ -130,47 +119,37 @@ const CheckPost = {
     );
   },
 
-  // --- ĐIỀU KHIỂN RADAR & HIGHLIGHT ---
-  updateRadar(change) {
-    this.state.activeScansCount = Math.max(
-      0,
-      this.state.activeScansCount + change,
-    );
-    document.getElementById("cp-radar-count").innerText =
-      this.state.activeScansCount;
-    this.radar.classList.toggle("active", this.state.activeScansCount > 0);
+  // --- ĐIỀU KHIỂN BADGE & HIGHLIGHT ---
+  updateBadge() {
+    try {
+        chrome.runtime.sendMessage({ action: "UPDATE_BADGE", count: this.state.totalLinksCount });
+    } catch(e) {}
   },
 
   applyHighlight(el, data) {
     if (!el || this.state.processedLinks.has(el)) return;
 
     el.classList.remove("cp-scan-loading");
-    const isPhish = data.is_phishing;
-    const isWarning = data.level?.includes("WARNING");
-    const isDanger =
-      data.level === "EXTREMELY DANGEROUS" || data.level === "DANGEROUS";
-    let bgColor = "";
-    let borderColor = "";
 
-    // 2. Dùng if...else if để gán giá trị theo điều kiện
-    if (isPhish && isDanger) {
-      bgColor = "rgba(255, 71, 87, 0.15)";
-      borderColor = "#ff4757";
-    } else if (isWarning) {
-      bgColor = "rgba(255, 165, 0, 0.15)";
-      borderColor = "#ffa500";
-    } else {
-      // Safe -> Màu Xanh
-      bgColor = "rgba(46, 204, 113, 0.12)";
-      borderColor = "#2ed573";
-    }
+    // Dùng trực tiếp field `color` mà backend trả về: "red" | "orange" | "green" | "gray"
+    // Đồng bộ 100% với colorMap trong popup.js
+    const colorScheme = {
+      red:    { bg: "rgba(231, 76,  60,  0.15)", border: "#e74c3c" },
+      orange: { bg: "rgba(230, 126, 34,  0.15)", border: "#e67e22" },
+      green:  { bg: "rgba(46,  204, 113, 0.10)", border: "#2ecc71" },
+      gray:   { bg: "rgba(149, 165, 166, 0.12)", border: "#95a5a6" },
+    };
+
+    const scheme = colorScheme[data.color] || colorScheme["gray"];
+
     Object.assign(el.style, {
-      backgroundColor: bgColor,
-      borderBottom: `2px solid ${borderColor}`,
+      backgroundColor: scheme.bg,
+      borderBottom: `2px solid ${scheme.border}`,
+      borderRadius: "2px",
       transition: "all 0.3s ease",
     });
     console.log(
-      `Link ${data.url} được đánh dấu là ${isPhish ? "Phishing" : "Safe"}`,
+      `[CheckPost] ${data.url} → ${data.color?.toUpperCase() || "GRAY"} (${data.level || "?"})`,
     );
 
     el.dataset.checkpostStatus = "done";
@@ -189,11 +168,16 @@ const CheckPost = {
     this.state.pendingUrls.add(link.href);
     link.classList.add("cp-scan-loading");
     link.dataset.checkpostStatus = "pending";
+    
+    this.state.totalLinksCount++;
+    this.updateBadge();
+
     this.scheduleBatch();
   },
 
   scheduleBatch() {
-    if (this.state.scanTimer) return;
+    // Hủy timer cũ nếu có link mới đến — luôn reset để góm được nhiều link nhất trong debounce window
+    if (this.state.scanTimer) clearTimeout(this.state.scanTimer);
     this.state.scanTimer = setTimeout(
       () => this.processBatch(),
       this.CONFIG.SCAN_DEBOUNCE_MS,
@@ -210,10 +194,7 @@ const CheckPost = {
     );
     batch.forEach((url) => this.state.pendingUrls.delete(url));
 
-    this.updateRadar(batch.length);
-
     chrome.runtime.sendMessage({ action: "AUTO_SCAN", urls: batch }, (res) => {
-      this.updateRadar(-batch.length);
       if (!res?.results) return;
       console.log(`Nhận kết quả cho batch ${batch.length}:`, res.results);
       res.results.forEach((item) => {
@@ -225,13 +206,30 @@ const CheckPost = {
   },
 
   markDomElements(item) {
-    const urls = [item.url].filter(Boolean);
-    console.log("Marking URLs in DOM:", urls);
-    urls.forEach((u) => {
-      document
-        .querySelectorAll(`a[href="${CSS.escape(u)}"]`)
-        .forEach((el) => this.applyHighlight(el, item));
+    // Thử match theo tất cả các dạng URL có thể có trong DOM:
+    // item.url      = link gốc (t.co/xyz) – là href thực tế trong thẻ <a>
+    // item.final_url = URL đích sau khi resolve redirect
+    const candidates = [item.url].filter(Boolean);
+    console.log("Marking URLs in DOM:", candidates);
+
+    let matched = false;
+    candidates.forEach((u) => {
+      const els = document.querySelectorAll(`a[href="${CSS.escape(u)}"]`);
+      if (els.length > 0) {
+        matched = true;
+        els.forEach((el) => this.applyHighlight(el, item));
+      }
     });
+
+    // Fallback: nếu không tìm thấy bằng href chính xác, thử tìm href chứa phần path của URL
+    if (!matched && item.url) {
+      try {
+        const urlPath = new URL(item.url).pathname; // Ví dụ: /XYZ123abc từ t.co/XYZ123abc
+        document
+          .querySelectorAll(`a[href*="${urlPath}"]`)
+          .forEach((el) => this.applyHighlight(el, item));
+      } catch (e) {}
+    }
   },
 
   // --- LẮNG NGHE SỰ KIỆN ---
@@ -281,12 +279,28 @@ const CheckPost = {
   resetAndScan() {
     console.log("🔄 SPA Navigation detected, re-syncing...");
     this.state.pendingUrls.clear();
-    this.state.activeScansCount = 0;
-    this.updateRadar(0);
-    this.syncWithStorage();
-    document
-      .querySelectorAll(this.CONFIG.LINK_SELECTOR)
-      .forEach((a) => this.queueLink(a));
+    this.state.totalLinksCount = 0;
+    this.updateBadge();
+    
+    // 1. Dọn sạch WeakSet để Garbage Collector gom rác
+    this.state.processedLinks = new WeakSet();
+    
+    // 2. Clear luôn localCache để ép Extension gửi lại link lên Background.
+    // Điều này đảm bảo Popup UI luôn có danh sách link của trang hiện tại.
+    // Đừng lo về tốc độ, vì Backend (Python) đã có TTLCache cực nhanh rồi!
+    this.state.localCache.clear();
+
+    // 3. Đợi SPA (React/Nextjs của X) render giao diện mới
+    setTimeout(() => {
+      document
+        .querySelectorAll(this.CONFIG.LINK_SELECTOR)
+        .forEach((a) => {
+          // Reset thẻ a để coi như là link mới tinh
+          a.classList.remove("cp-scan-loading");
+          delete a.dataset.checkpostStatus;
+          this.queueLink(a);
+        });
+    }, 500);
   },
 
   syncWithStorage() {
@@ -414,13 +428,20 @@ const CheckPost = {
                     <span class="cp-info-value">${details.domain || "N/A"}</span>
                 </div>
                 <div class="cp-info-row">
-                    <span class="cp-info-label">Quốc gia:</span>
-                    <span class="cp-info-value">${details.country || "N/A"}</span>
-                </div>
-                <div class="cp-info-row">
                     <span class="cp-info-label">Độ tin cậy:</span>
                     <span class="cp-info-value" style="color:${isPhish ? "#e74c3c" : "#2ecc71"}">${trustScore}%</span>
                 </div>
+                ${details.red_flags && details.red_flags.length > 0 ? `
+                <div style="margin-top: 8px; padding-top: 8px; border-top: 1px dashed #eee;">
+                    <div class="cp-info-label" style="font-size: 11px; margin-bottom: 4px;">🚩 Phân tích từ hệ thống:</div>
+                    <div style="font-size: 12px; color: #e74c3c; line-height: 1.4;">${details.red_flags[0]}</div>
+                </div>
+                ` : `
+                <div style="margin-top: 8px; padding-top: 8px; border-top: 1px dashed #eee;">
+                    <div class="cp-info-label" style="font-size: 11px; margin-bottom: 4px;">✅ Phân tích từ hệ thống:</div>
+                    <div style="font-size: 12px; color: #2ecc71;">Không phát hiện dấu hiệu lừa đảo.</div>
+                </div>
+                `}
                 ${isPhish ? `<div style="font-size:11px; color:#e74c3c; margin-top:5px; padding:6px; background:rgba(231,76,60,0.1); border-radius:6px">⚠️ Đây có thể là trang web giả mạo nhằm lấy cắp thông tin.</div>` : ""}
                 <button class="cp-close-btn">Đóng lại</button>
             `;

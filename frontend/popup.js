@@ -143,20 +143,55 @@ const App = {
     if (!reasonElem || !reasonElem.value) return;
 
     try {
-      const res = await fetch(`${CONFIG.SERVER_URL}report`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          url: state.activeTabUrl,
-          reason: reasonElem.value,
-        }),
+      const response = await chrome.runtime.sendMessage({
+        action: "REPORT_URL",
+        url: state.activeTabUrl,
+        reason: reasonElem.value,
       });
-      const data = await res.json();
       reasonElem.value = "";
       btn.innerText = data.result || "Sent";
       btn.disabled = true;
     } catch (err) {
       console.error("Report failed", err);
+    }
+  },
+  // --- 7. GỬI BÁO CÁO CHO TỪNG LINK CỤ THỂ (INLINE) ---
+  async handleInlineReport(item, btn) {
+    const reportUrl = item.final_url ;
+    if (!reportUrl) return;
+
+    const action = btn.getAttribute("data-action") || "REPORT_URL";
+    const originalColor = btn.getAttribute("data-color") || "#e74c3c";
+    const originalText = btn.innerText;
+    
+    btn.innerText = "Đang gửi...";
+    btn.disabled = true;
+
+    try {
+      const response = await chrome.runtime.sendMessage({
+        action: action,
+        url: reportUrl,
+        reason: action === "REPORT_MISTAKE" ? "Report safe site" : "Report phishing site",
+      });
+
+      if (!response || !response.success) {
+        throw new Error(response?.error || "Unknown error");
+      }
+      btn.innerText = "✅ Reported";
+      btn.style.borderColor = "#2ecc71";
+      btn.style.color = "#2ecc71";
+      btn.style.background = "transparent";
+      btn.onmouseover = null;
+      btn.onmouseout = null;
+    } catch (err) {
+      console.error("Inline report failed", err);
+      btn.innerText = "❌ Failed";
+      btn.disabled = false;
+      setTimeout(() => {
+        btn.innerText = originalText;
+        btn.style.borderColor = originalColor;
+        btn.style.color = originalColor;
+      }, 2000);
     }
   },
 };
@@ -183,21 +218,24 @@ const UI = {
   },
 
   renderCard(item) {
-    // 1. Mapping màu sắc & Icon đồng bộ
+    // Mapping đồng bộ với giá trị backend trả về: "green", "orange", "red", "gray"
     const colorMap = {
-      Green: { hex: "#2ecc71", icon: "✅" },
-      "Light Yellow": { hex: "#a2d149", icon: "✅" },
-      Yellow: { hex: "#f1c40f", icon: "⚠️" },
-      Orange: { hex: "#e67e22", icon: "🚫" },
-      Red: { hex: "#e74c3c", icon: "🚫" },
+      green:  { hex: "#2ecc71", icon: "✅", label: "AN TOÀN" },
+      orange: { hex: "#e67e22", icon: "⚠️", label: "CẢNH BÁO" },
+      red:    { hex: "#e74c3c", icon: "🚫", label: "NGUY HIỂM" },
+      gray:   { hex: "#95a5a6", icon: "❓", label: "KHÔNG XÁC ĐỊNH" },
     };
-    console.log("🔍 Render card for URL:", item.url, "with color:", item.color);
-    const statusConfig = colorMap[item.color] || { hex: "#95a5a6", icon: "❓" };
+    const statusConfig = colorMap[item.color] || colorMap["gray"];
     const baseColor = statusConfig.hex;
     const isDarkText = item.color === "Yellow"; // Chữ đen trên nền vàng cho dễ đọc
     const displayUrl = item.meta_url || "Unknown URL";
     const shortUrl =
       displayUrl.length > 50 ? displayUrl.substring(0, 50) + "..." : displayUrl;
+
+    const isDangerous = item.color === "red" || item.color === "orange";
+    const reportBtnText = isDangerous ? "✅ Report as Safe" : "🚩 Report as Phishing";
+    const reportBtnColor = isDangerous ? "#2ecc71" : "#e74c3c";
+    const reportAction = isDangerous ? "REPORT_MISTAKE" : "REPORT_URL";
 
     const li = document.createElement("li");
     // Thêm border-left màu để nhận diện nhanh
@@ -222,14 +260,7 @@ const UI = {
             <span>📊 Safety Score:</span> 
             <b>${item.risk_score || "N/A"}%</b>
         </div>
-        <div class="detail-row">
-            <span>📍 Country:</span> 
-            <b>${item.country || "N/A"}</b>
-        </div>
-        <div class="detail-row">
-            <span>🏢 Provider:</span> 
-            <b>${item.org || "N/A"}</b>
-        </div>
+
         
         <!-- Phần giải thích cơ sở xác định -->
         <div class="red-flags-box" style="background-color: ${baseColor}15; border-color: ${baseColor}50;">
@@ -245,9 +276,22 @@ const UI = {
             }
         </div>
         
-        <div class="detail-link" style="margin-top: 15px; display: flex; justify-content: flex-end;">
-          <a href="${item.final_url}" target="_blank" style="color: ${baseColor}; text-decoration: none; font-weight: bold; margin-top: 5px;">Visit Link ↗</a>
-          <button type="button" class="btn btn-sm view-post-btn" style="background-color: ${baseColor}; color: ${isDarkText ? "#333" : "#fff"}; margin-left: 15px; border: none; padding: 5px 15px; border-radius: 4px; font-weight: bold;">
+        <div class="detail-link" style="margin-top: 15px; display: flex; justify-content: flex-end; gap: 10px; align-items: center;">
+          <button type="button" class="btn-inline-report" data-action="${reportAction}" data-color="${reportBtnColor}" style="
+              background: transparent;
+              border: 1px solid ${reportBtnColor};
+              color: ${reportBtnColor};
+              padding: 5px 12px;
+              border-radius: 4px;
+              font-size: 12px;
+              font-weight: bold;
+              cursor: pointer;
+              transition: all 0.2s;
+            " 
+            onmouseover="this.style.background='${reportBtnColor}';this.style.color='#fff';"
+            onmouseout="this.style.background='transparent';this.style.color='${reportBtnColor}';"
+          >${reportBtnText}</button>
+          <button type="button" class="btn btn-sm view-post-btn" style="background-color: ${baseColor}; color: ${isDarkText ? "#333" : "#fff"}; border: none; padding: 5px 15px; border-radius: 4px; font-weight: bold;">
             View post
           </button>
         </div>
@@ -259,6 +303,14 @@ const UI = {
       viewButton.addEventListener("click", (event) => {
         event.stopPropagation();
         App.scrollToPost(item);
+      });
+    }
+
+    const reportButton = li.querySelector(".btn-inline-report");
+    if (reportButton) {
+      reportButton.addEventListener("click", (event) => {
+        event.stopPropagation();
+        App.handleInlineReport(item, reportButton);
       });
     }
 

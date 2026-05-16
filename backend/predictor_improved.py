@@ -8,6 +8,7 @@ Mô hình: XGBoost Calibrated trained on PhiUSIIL 2023 (Cleaned).
 import os
 import re
 import math
+import asyncio
 import socket
 import json
 from datetime import datetime
@@ -16,6 +17,8 @@ from typing import Dict, List, Optional
 
 import httpx
 import joblib
+import pandas as pd
+import numpy as np
 from bs4 import BeautifulSoup
 import tldextract
 from cachetools import TTLCache
@@ -64,14 +67,43 @@ def _get_shap_explainer():
 _feature_cache: TTLCache = TTLCache(maxsize=500, ttl=3600)
 
 # ============================================================================
+# GLOBAL HTTP CLIENT — Connection Pool (tái sử dụng TCP/TLS, không tạo mới mỗi lần)
+# ============================================================================
+_predictor_client: httpx.AsyncClient | None = None
+
+async def _get_predictor_client() -> httpx.AsyncClient:
+    global _predictor_client
+    if _predictor_client is None or _predictor_client.is_closed:
+        _predictor_client = httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=httpx.Timeout(connect=2.0, read=3.0, write=2.0, pool=2.0),
+            limits=httpx.Limits(max_connections=50, max_keepalive_connections=20),
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"},
+        )
+    return _predictor_client
+
+# ============================================================================
 # WHITELIST & RISK DICTIONARIES
 # ============================================================================
 
-LEGITIMATE_DOMAINS = {
-    "youtu.be", "x.com", "google.com", "youtube.com", "facebook.com", "amazon.com",
-    "wikipedia.org", "github.com", "stackoverflow.com", "python.org", "microsoft.com",
-    "apple.com", "linkedin.com", "instagram.com", "twitter.com", "reddit.com"
-}
+LEGITIMATE_DOMAINS = set()
+try:
+    _whitelist_path = os.path.join(_BASE_DIR, "Datasets", "top-1m.csv")
+    with open(_whitelist_path, "r", encoding="utf-8") as f:
+        for line in f:
+            parts = line.strip().split(",")
+            if len(parts) >= 2:
+                LEGITIMATE_DOMAINS.add(parts[1].lower())
+    print(f"[OK] Loaded {len(LEGITIMATE_DOMAINS):,} legitimate domains from top-1m whitelist.")
+    # Thêm thủ công các shortlink phổ biến vào whitelist (thường không có trong Alexa/Tranco root domain list)
+    LEGITIMATE_DOMAINS.update({"youtu.be", "t.co", "bit.ly", "goo.gl"})
+except Exception as e:
+    print(f"[!] Could not load top-1m.csv ({e}). Using default fallback whitelist.")
+    LEGITIMATE_DOMAINS = {
+        "youtu.be", "x.com", "google.com", "youtube.com", "facebook.com", "amazon.com",
+        "wikipedia.org", "github.com", "stackoverflow.com", "python.org", "microsoft.com",
+        "apple.com", "linkedin.com", "instagram.com", "twitter.com", "reddit.com", "t.co"
+    }
 
 TOP_50_BRANDS = [
     "google", "facebook", "microsoft", "apple", "amazon", "netflix", "paypal",
@@ -93,7 +125,7 @@ def _is_whitelisted(url: str) -> bool:
 # FEATURE EXTRACTION (36 Features PhiUSIIL)
 # ============================================================================
 
-async def extract_features_async(url: str) -> Dict[str, float]:
+async def extract_features_async(url: str, prefetched_html: str | None = None) -> Dict[str, float]:
     cache_key = url.lower().strip()
     if cache_key in _feature_cache:
         return _feature_cache[cache_key]
@@ -160,47 +192,54 @@ async def extract_features_async(url: str) -> Dict[str, float]:
     features['HasCopyrightInfo'] = 0.0
 
     try:
-        async with httpx.AsyncClient(timeout=3.0, follow_redirects=True,
-                                     headers={"User-Agent": "Mozilla/5.0"}) as client:
+        if prefetched_html is not None:
+            # ✅ Sử dụng HTML đã có sẵn — không cần GET thêm
+            html = prefetched_html
+            redirect_count = 0
+        else:
+            client = await _get_predictor_client()
             response = await client.get(url)
-            html = response.text.lower()
-            soup = BeautifulSoup(response.text, 'html.parser')
+            html = response.text
+            redirect_count = len(response.history)
+        # BeautifulSoup CPU-bound — chạy trong thread riêng
+        soup = await asyncio.to_thread(BeautifulSoup, html, 'html.parser')
+        html_lower = html.lower()
             
-            features['NoOfURLRedirect'] = len(response.history)
+        features['NoOfURLRedirect'] = redirect_count
+        
+        if soup.title and soup.title.string:
+            features['HasTitle'] = 1.0
+        if soup.find('link', rel=lambda v: v and 'icon' in v.lower()):
+            features['HasFavicon'] = 1.0
+        if soup.find('meta', attrs={'name': 'robots'}):
+            features['Robots'] = 1.0
+        if soup.find('meta', attrs={'name': 'viewport'}):
+            features['IsResponsive'] = 1.0
+        if soup.find('meta', attrs={'name': 'description'}):
+            features['HasDescription'] = 1.0
             
-            if soup.title and soup.title.string:
-                features['HasTitle'] = 1.0
-            if soup.find('link', rel=lambda v: v and 'icon' in v.lower()):
-                features['HasFavicon'] = 1.0
-            if soup.find('meta', attrs={'name': 'robots'}):
-                features['Robots'] = 1.0
-            if soup.find('meta', attrs={'name': 'viewport'}):
-                features['IsResponsive'] = 1.0
-            if soup.find('meta', attrs={'name': 'description'}):
-                features['HasDescription'] = 1.0
-                
-            features['NoOfPopup'] = 1.0 if 'window.open' in html or 'alert(' in html else 0.0
-            features['NoOfiFrame'] = 1.0 if soup.find('iframe') else 0.0
+        features['NoOfPopup'] = 1.0 if 'window.open' in html_lower or 'alert(' in html_lower else 0.0
+        features['NoOfiFrame'] = 1.0 if soup.find('iframe') else 0.0
+        
+        forms = soup.find_all('form')
+        for form in forms:
+            action = form.get('action', '').lower()
+            if action and not action.startswith('/') and domain not in action:
+                features['HasExternalFormSubmit'] = 1.0
+                break
+        
+        socials = ['facebook.com', 'twitter.com', 'instagram.com', 'linkedin.com']
+        if any(s in html_lower for s in socials):
+            features['HasSocialNet'] = 1.0
             
-            forms = soup.find_all('form')
-            for form in forms:
-                action = form.get('action', '').lower()
-                if action and not action.startswith('/') and domain not in action:
-                    features['HasExternalFormSubmit'] = 1.0
-                    break
-            
-            socials = ['facebook.com', 'twitter.com', 'instagram.com', 'linkedin.com']
-            if any(s in html for s in socials):
-                features['HasSocialNet'] = 1.0
-                
-            if soup.find('input', type='submit') or soup.find('button', type='submit'):
-                features['HasSubmitButton'] = 1.0
-            if soup.find('input', type='hidden'):
-                features['HasHiddenFields'] = 1.0
-            if soup.find('input', type='password'):
-                features['HasPasswordField'] = 1.0
-            if 'copyright' in html or '©' in html:
-                features['HasCopyrightInfo'] = 1.0
+        if soup.find('input', type='submit') or soup.find('button', type='submit'):
+            features['HasSubmitButton'] = 1.0
+        if soup.find('input', type='hidden'):
+            features['HasHiddenFields'] = 1.0
+        if soup.find('input', type='password'):
+            features['HasPasswordField'] = 1.0
+        if 'copyright' in html_lower or '©' in html_lower:
+            features['HasCopyrightInfo'] = 1.0
 
     except Exception as e:
         print(f"[!] Error fetching {url}: {e} -> Using neutral content features")
@@ -259,7 +298,7 @@ def heuristic_phishing_score(url: str, features_dict: Dict) -> float:
 # RED FLAGS (SHAP-based Explanations)
 # ============================================================================
 
-def generate_red_flags(url: str, features_dict: Dict, model_proba: float) -> List[str]:
+async def generate_red_flags(url: str, features_dict: Dict, model_proba: float) -> List[str]:
     flags = []
     
     # 1. Heuristic hard flags
@@ -282,20 +321,17 @@ def generate_red_flags(url: str, features_dict: Dict, model_proba: float) -> Lis
     try:
         explainer = _get_shap_explainer()
         if explainer and model_proba >= OPTIMAL_THRESHOLD:
-            import pandas as pd
-            import numpy as np
-            # Convert to correct shape
             df_single = pd.DataFrame([features_dict], columns=REQUIRED_FEATURES)
-            sv = explainer.shap_values(df_single)
+            # SHAP CPU-bound — chạy trong thread riêng
+            def _run_shap():
+                sv = explainer.shap_values(df_single)
+                if isinstance(sv, list):
+                    return sv[1][0]
+                elif len(sv.shape) == 3:
+                    return sv[0, :, 1]
+                return sv[0]
+            shap_vals = await asyncio.to_thread(_run_shap)
             
-            # Extract SHAP values (handle different SHAP return types)
-            if isinstance(sv, list):
-                shap_vals = sv[1][0]
-            elif len(sv.shape) == 3:
-                shap_vals = sv[0, :, 1]
-            else:
-                shap_vals = sv[0]
-                
             # Get top 2 features pushing score towards phishing
             top_indices = np.argsort(shap_vals)[-2:][::-1]
             for idx in top_indices:
@@ -325,7 +361,7 @@ def generate_red_flags(url: str, features_dict: Dict, model_proba: float) -> Lis
 # MAIN PREDICT FUNCTION
 # ============================================================================
 
-async def predict_phishing(url: str) -> Dict:
+async def predict_phishing(url: str, prefetched_html: str | None = None) -> Dict:
     url = url.strip()
     if not url.startswith(('http://', 'https://')):
         url = 'http://' + url
@@ -343,14 +379,15 @@ async def predict_phishing(url: str) -> Dict:
         }
 
     try:
-        # 2. Extract Features
-        features_dict = await extract_features_async(url)
+        # 2. Extract Features — dùng lại HTML đã fetch nếu có
+        features_dict = await extract_features_async(url, prefetched_html=prefetched_html)
         
-        import pandas as pd
         df = pd.DataFrame([features_dict], columns=REQUIRED_FEATURES)
 
-        # 3. Model Prediction
-        y_proba = float(model.predict_proba(df)[0, 1])
+        # 3. Model Prediction — CPU-bound, chạy trong thread riêng
+        def _run_model():
+            return float(model.predict_proba(df)[0, 1])
+        y_proba = await asyncio.to_thread(_run_model)
         is_phish_ml = y_proba >= OPTIMAL_THRESHOLD
 
         # 4. Heuristic Prediction
@@ -361,7 +398,7 @@ async def predict_phishing(url: str) -> Dict:
         is_phishing = is_phish_ml or is_phish_h
         
         # 6. Explanations
-        red_flags = generate_red_flags(url, features_dict, y_proba)
+        red_flags = await generate_red_flags(url, features_dict, y_proba)
 
         return {
             "url": url,

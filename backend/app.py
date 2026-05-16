@@ -1,6 +1,7 @@
 # Libraries and frameworks
 import uvicorn
 import httpx
+import time
 from pydantic import BaseModel
 from fastapi import FastAPI
 import csv
@@ -18,8 +19,7 @@ from dotenv import load_dotenv
 load_dotenv()  # Load environment variables from .env file
 
 # Local files
-from feature import ManualFeatureExtractor
-from predictor_improved import predict_phishing
+from predictor_improved import predict_phishing, _is_whitelisted
 from helpers import get_domain_name,check_google_batch
 from models import PhishingReportSchema, reviewDetectionSchema, PhishingReport, newsDetectionSchema, mistakePhishingReport
 import socket
@@ -85,31 +85,35 @@ async def index():
 
 # report phishing and save to database
 @app.post('/report')
-async def report(report: PhishingReportSchema):
-    domain = get_domain_name(report.url)
-    reports = await PhishingReport.all()
-    urls = [report.url for report in reports]
-    if domain in urls:
-        return {'result': 'already reported'}
-    elif not domain:
+async def report(payload: PhishingReportSchema):
+    domain = get_domain_name(payload.url)
+    if not domain:
         return {'result': 'invalid url'}
-    report = PhishingReport(url=domain, reason=report.reason)
-    await report.save()
+        
+    # Logic chuẩn Database: Query trực tiếp thay vì tải toàn bộ bảng vào RAM
+    if await PhishingReport.filter(url=domain).exists():
+        return {'result': 'already reported'}
+        
+    new_report = PhishingReport(url=domain, reason=payload.reason)
+    await new_report.save()
     return {'result': 'success'}
 
 
 # report mistake phishing and save to database
 @app.post('/report_mistake')
-async def report_mistake(report: PhishingReportSchema):
-    domain = get_domain_name(report.url)
-    reports = await mistakePhishingReport.all()
-    urls = [report.url for report in reports]
-    if domain in urls:
-        return {'result': 'already reported'}
-    elif not domain:
+async def report_mistake(payload: PhishingReportSchema):
+    domain = get_domain_name(payload.url)
+    if not domain:
         return {'result': 'invalid url'}
-    report = mistakePhishingReport(url=domain, reason=report.reason, real=True)
-    await report.save()
+        
+    # Logic chuẩn Database: Query trực tiếp
+    if await mistakePhishingReport.filter(url=domain).exists():
+        return {'result': 'already reported'}
+        
+    # Vẫn giữ real=True (Tự động duyệt) như code cũ của bạn
+    # Nếu muốn có Admin duyệt, hãy đổi thành real=False
+    new_report = mistakePhishingReport(url=domain, reason=payload.reason, real=True)
+    await new_report.save()
     return {'result': 'success'}
 
 
@@ -141,7 +145,7 @@ async def analyze_link(url: str):
     domain = get_domain_name(url)
     if not domain:
         return {"error": "Invalid URL", "is_phishing": True, "details": None}
-
+    
     # Use the new comprehensive predict_phishing function
     prediction_result = await predict_phishing(url)
     
@@ -151,38 +155,43 @@ async def analyze_link(url: str):
     score = prediction_result["phishing_probability"] * 100 # Chuyển thành %
     h_score = prediction_result["heuristic_score"]
     
-    # Tính level và color tương tự cũ để Frontend dùng
-    if prediction_result["is_phishing"]:
-        level = "Nguy hiểm"
-        color = "red"
-    elif h_score >= 30 or score >= 30:
-        level = "Cảnh báo"
-        color = "orange"
-    else:
+    is_phishing_in_db = await PhishingReport.filter(url=domain, real=True).exists()
+    is_safe_in_db = await mistakePhishingReport.filter(url=domain, real=True).exists()
+    
+    is_phishing = prediction_result["is_phishing"] or is_phishing_in_db
+    red_flags = prediction_result.get("red_flags", [])
+
+    if is_safe_in_db:
+        is_phishing = False
         level = "An toàn"
         color = "green"
+        red_flags = ["Được báo cáo là an toàn"]
+        score = 0.0
+        h_score = 0
+    else:
+        # Tính level và color tương tự cũ để Frontend dùng
+        if is_phishing:
+            level = "Nguy hiểm"
+            color = "red"
+        elif h_score >= 30 or score >= 30:
+            level = "Cảnh báo"
+            color = "orange"
+        else:
+            level = "An toàn"
+            color = "green"
 
     print(f"Kết quả dự đoán trong analyze:")
     print(f"    - Mức độ: {level}")
     print(f"    - Xác suất ML: {score:.2f}% | Heuristic: {h_score}/100")
-    print(f"    - Cảnh báo lừa đảo: {'CÓ' if prediction_result['is_phishing'] else 'KHÔNG'}")
+    print(f"    - Cảnh báo lừa đảo: {'CÓ' if is_phishing else 'KHÔNG'}")
     
-    # phishing hoặc có trong database phishing
-    is_in_db = await PhishingReport.filter(url=domain, real=True).exists()
-    is_phishing = prediction_result["is_phishing"] or is_in_db
-    
-    # Try to get country info if we still need it (though it's not ML feature anymore)
-    country = "Unknown"
-
     # --- 2. Lấy thông tin chi tiết từ features đã trích xuất 
     details = {
         "domain": domain,
-        "country": country,
-        "org": "Unknown", 
         "level": level,
         "risk_score": score,
         "color": color,
-        "red_flags": prediction_result["red_flags"]
+        "red_flags": red_flags
     }
 
     # --- 3. Trả về kết quả tổng hợp ---
@@ -192,6 +201,11 @@ async def analyze_link(url: str):
         "details": details
     }
 
+
+from cachetools import TTLCache
+
+# ✅ Resolution Cache: tránh resolve lại cùng 1 t.co URL (cache 1 giờ)
+_url_resolution_cache: TTLCache = TTLCache(maxsize=2000, ttl=3600)
 
 # ✅ FIX 1: Reuse 1 client cho tất cả requests (tránh TLS handshake mỗi lần)
 _client: httpx.AsyncClient | None = None
@@ -210,6 +224,23 @@ async def get_client() -> httpx.AsyncClient:
 
 
 async def get_original_url(short_url: str) -> dict:
+    # ✅ Kiểm tra resolution cache trước — tránh HTTP call lặp lại
+    cache_key = short_url.lower().strip()
+    if cache_key in _url_resolution_cache:
+        return _url_resolution_cache[cache_key]
+
+    # ✅ Fast-path: Nếu URL không phải t.co, không cần HTTP call — trả ngay
+    is_tco = 't.co/' in short_url
+    if not is_tco:
+        data = {
+            "original_url": short_url,
+            "meta_url": short_url,
+            "final_url": short_url,
+            "status": "direct",
+        }
+        _url_resolution_cache[cache_key] = data
+        return data
+
     data = {
         "original_url": short_url,
         "meta_url": short_url,
@@ -230,6 +261,7 @@ async def get_original_url(short_url: str) -> dict:
             data["meta_url"] = str(response.url)
             data["final_url"] = str(response.url)
             data["status"] = "resolved"
+            _url_resolution_cache[cache_key] = data
             return data
         print(f"🔗 Đang phân tích URL: {response.url} - Vẫn là t.co, sẽ kiểm tra meta refresh...")
         # Parse meta refresh từ HTML
@@ -239,10 +271,11 @@ async def get_original_url(short_url: str) -> dict:
         )
 
         if not meta_match:
-            # Không tìm thấy meta refresh → trả URL hiện tại
             data["meta_url"] = str(response.url)
             data["final_url"] = str(response.url)
             data["status"] = "meta"
+            data["html"] = html_content  # truyền xuống để tránh double-fetch
+            _url_resolution_cache[cache_key] = data
             return data
 
         # ═══════════════════════════════════════════
@@ -256,33 +289,22 @@ async def get_original_url(short_url: str) -> dict:
         #          Nếu fail → vẫn trả meta_url
         # ═══════════════════════════════════════════
 
-        # 3a. DNS check trước (nhanh, tránh timeout dài)
-        parsed = urlparse(raw_meta_url)
-        domain = parsed.netloc or parsed.path.split("/")[0]
-        try:
-            socket.getaddrinfo(domain, None, socket.AF_INET)
-        except socket.gaierror:
-            # DNS fail → domain không tồn tại
-            print(f"❌ DNS fail cho domain: {domain}")
-            data["final_url"] = raw_meta_url  # ✅ Trả meta_url thay vì t.co
-            data["status"] = "dns_failed"
-            return data
-
-        # 3b. DNS OK → thử GET/HEAD để lấy final URL (sau redirect chain)
+        # 3b. HEAD request để lấy final URL — httpx tự xử lý cả DNS fail + HTTP fail
         try:
             final_response = await client.head(raw_meta_url)
             data["final_url"] = str(final_response.url)
             data["status"] = "resolved"
         except Exception:
-            # HTTP fail nhưng DNS OK → trả meta_url
-            print(f"❌ HTTP fail cho URL: {raw_meta_url}")
-            data["final_url"] = raw_meta_url  # ✅ Vẫn trả meta_url
+            print(f"❌ Không thể kết nối: {raw_meta_url}")
+            data["final_url"] = raw_meta_url
             data["status"] = "unreachable"
 
+        _url_resolution_cache[cache_key] = data
         return data
 
     except Exception as e:
         print(f"❌ Lỗi: {e}")
+        # Không cache lỗi — mỗi lần thử lại
         return data
 
 
@@ -304,11 +326,14 @@ async def close_client():
         await _client.aclose()
 
 async def predict_single_url(url: dict) -> dict:
+    t0 = time.perf_counter()
     url_final = url["final_url"]
+    prefetched_html = url.get("html")  # HTML đã fetch từ bước resolve
     domain = get_domain_name(url_final)
     is_phishing_in_databse = await PhishingReport.filter(url=domain,real=True).all().exists()
+    is_safe_in_db = await mistakePhishingReport.filter(url=domain,real=True).all().exists()
     
-    prediction_result = await predict_phishing(url_final)
+    prediction_result = await predict_phishing(url_final, prefetched_html=prefetched_html)
     
     if prediction_result.get("status") == "error":
         score = 0
@@ -322,40 +347,49 @@ async def predict_single_url(url: dict) -> dict:
         h_score = prediction_result.get("heuristic_score", 0)
         is_phish = prediction_result.get("is_phishing", False) or is_phishing_in_databse
         
-        if prediction_result.get("is_phishing", False):
-            level = "Nguy hiểm"
-            color = "red"
-        elif h_score >= 30 or score >= 30:
-            level = "Cảnh báo"
-            color = "orange"
-        else:
+        if is_safe_in_db:
+            is_phish = False
             level = "An toàn"
             color = "green"
-        red_flags = prediction_result.get("red_flags", [])
+            red_flags = ["Được báo cáo là an toàn"]
+            score = 0.0
+            h_score = 0
+        else:
+            if is_phish:
+                level = "Nguy hiểm"
+                color = "red"
+            elif h_score >= 30 or score >= 30:
+                level = "Cảnh báo"
+                color = "orange"
+            else:
+                level = "An toàn"
+                color = "green"
+            red_flags = prediction_result.get("red_flags", [])
 
     results = {
         "url": url["original_url"],
         "meta_url": url["meta_url"],
         "final_url": url["final_url"],
         "is_phishing": is_phish,
-        "country": "Unknown",
-        "org": "Unknown", 
         "risk_score": score,
         "color": color,
         "red_flags": red_flags,
         "level": level,
     }
+    elapsed = (time.perf_counter() - t0) * 1000
+    print(f"⏱️  [{color.upper():6}] {url_final[:55]} — {elapsed:.0f}ms")
     return results
 
 @app.post("/scan-links")
 async def scan_multiple_links(data: UrlList):
-    
-    # Xử lý tối đa 10 link 
-    process_urls = list(set(data.urls))[:10]
-    results = await resolve_batch(data.urls, max_concurrent=3)  # Giới hạn 5 concurrent requests để tránh quá tải link gốc + meta
-    print(f"✅ Đã xử lý {len(results)} final_url: {[r['final_url'] for r in results]}, original_url: {[r['original_url'] for r in results]}, meta_url: {[r['meta_url'] for r in results]}")
+    t_start = time.perf_counter()
+    process_urls = list(dict.fromkeys(data.urls))[:30]
+    results = await resolve_batch(process_urls, max_concurrent=10)
+    t_resolve = time.perf_counter()
     tasks = [predict_single_url(r) for r in results]
-    results = await asyncio.gather(*tasks)   #đợi lấy hết các tasks gửi background 
+    results = await asyncio.gather(*tasks)
+    t_end = time.perf_counter()
+    print(f"\n📊 BATCH SUMMARY: {len(results)} links | resolve={((t_resolve-t_start)*1000):.0f}ms | predict={((t_end-t_resolve)*1000):.0f}ms | TOTAL={(t_end-t_start)*1000:.0f}ms\n")
     return results
 
 

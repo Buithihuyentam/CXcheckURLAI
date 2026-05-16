@@ -1,0 +1,34 @@
+\chapter*{KẾT LUẬN}
+\addcontentsline{toc}{chapter}{KẾT LUẬN VÀ HƯỚNG PHÁT TRIỂN}
+
+Sau một thời gian nghiên cứu và thực hiện đề tài \textbf{"Xây dựng tiện ích trình duyệt phát hiện trang web lừa đảo dựa trên mô hình trí tuệ nhân tạo"}, luận văn đã hoàn thành các mục tiêu đề ra ban đầu. Dưới đây là tổng kết về các kết quả đạt được và những hạn chế còn tồn tại.
+
+\section*{1. Kết quả đạt được}
+
+Đề tài đã xây dựng thành công hệ thống \textbf{CheckPost} – một tiện ích mở rộng trên trình duyệt Chrome có khả năng bảo vệ người dùng trước các liên kết lừa đảo (phishing) theo thời gian thực. Cụ thể:
+
+\begin{itemize}
+    \item \textbf{Về mặt nghiên cứu:} Đã tổng hợp và phân tích sâu tri thức về các đặc trưng của URL độc hại (Lexical, DNS) và thực hiện thành công \textbf{Ablation Study} để giải quyết triệt để vấn đề rò rỉ dữ liệu (Data Leakage) thường gặp trong các bộ dữ liệu an ninh mạng truyền thống.
+    \item \textbf{Về mặt công nghệ:} Làm chủ được kiến trúc \textbf{Manifest V3} mới nhất của Google Chrome. Đặc biệt, đã ứng dụng thành công kỹ thuật \textbf{MutationObserver} để giải quyết bài toán tự động trích xuất và kiểm tra liên kết nằm bên trong các bài đăng được tải động trên mạng xã hội.
+    \item \textbf{Về mặt mô hình AI:} Đã triển khai thành công kiến trúc \textbf{Hybrid Engine} kết hợp giữa thuật toán \textbf{XGBoost} (đã hiệu chuẩn xác suất Isotonic) và bộ lọc Heuristic Typosquatting (Khoảng cách Levenshtein). Hệ thống đạt tỷ lệ phát hiện (Recall) xuất sắc với \textbf{FPR = 0\%}, loại bỏ hoàn toàn cảnh báo nhầm (False Positives). Thêm vào đó, khả năng giải thích dự đoán (SHAP) giúp cung cấp các "Cờ đỏ" minh bạch cho người dùng.
+    \item \textbf{Về mặt sản phẩm:} CheckPost cung cấp giao diện trực quan, cảnh báo kịp thời thông qua lớp phủ bảo vệ (Overlay) ngay tại bài đăng, giúp người dùng chủ động phòng tránh rủi ro mất mát thông tin nhạy cảm.
+\end{itemize}
+
+\section*{2. Hạn chế của đề tài}
+
+Mặc dù đạt được những kết quả khả quan, hệ thống vẫn còn tồn tại một số hạn chế nhất định cần được khắc phục trong tương lai:
+
+\begin{itemize}
+    \item \textbf{Sự phụ thuộc vào đặc trưng từ vựng:} Mặc dù kết hợp Heuristic để chống Typosquatting, mô hình hiện tại vẫn chủ yếu dựa trên cấu trúc chuỗi ký tự của URL. Đối với các kỹ thuật che giấu liên kết tinh vi đằng sau nhiều lớp chuyển hướng (Multiple Redirects) chưa được phân giải hết, AI có thể gặp khó khăn.
+    \item \textbf{Dữ liệu huấn luyện:} Mặc dù đã sử dụng bộ dữ liệu hiện đại PhiUSIIL 2023, nhưng kẻ tấn công luôn thay đổi kỹ thuật hàng ngày. Mô hình AI cần được xây dựng pipeline tự động tái huấn luyện (CI/CD for ML) để cập nhật các mẫu "Zero-day phishing" mới nhất liên tục.
+    \item \textbf{Hiệu năng phần cứng mạng:} Việc phân giải các liên kết \texttt{t.co} yêu cầu gửi các HTTP Request liên tục. Nếu người dùng lướt bảng tin với tốc độ quá nhanh, số lượng Request tăng đột biến có thể gây quá tải cho các mạng WiFi công cộng hoặc mạng có băng thông thấp.
+\end{itemize}
+
+\section*{3. Hướng phát triển tương lai}
+
+Để hoàn thiện hệ thống, các hướng nghiên cứu tiếp theo sẽ tập trung vào:
+\begin{enumerate}
+    \item Tích hợp cơ chế \textbf{Community Reporting} để người dùng có thể báo cáo các link độc hại trực tiếp từ Extension, giúp làm giàu tập dữ liệu huấn luyện.
+    \item Nghiên cứu các kỹ thuật tối ưu hóa mô hình Deep Learning (như Model Quantization) để có thể nhúng các mạng nơ-ron mạnh mẽ hơn vào trình duyệt mà không gây trễ.
+    \item Phát triển tính năng phân tích sâu nội dung trang web (HTML/Visual Analysis) sau khi người dùng click để tạo ra lớp bảo vệ thứ hai sau lớp URL.
+\end{enumerate}
